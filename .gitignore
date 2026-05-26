@@ -18,3 +18,10 @@ develop-eggs
 
 test/korail_idpw.txt
 .idea
+
+# 자격증명 (절대 커밋 금지)
+.env
+
+# Claude Code 로컬 상태
+.claude/
+

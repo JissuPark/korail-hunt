@@ -1,9 +1,10 @@
 language: python
 python:
-  - "2.7"
-# command to install dependencies
+  - "3.10"
+  - "3.11"
+  - "3.12"
 install:
-  - python setup.py -q install
-# command to run tests
-script: 
-  - python -m unittest discover
+  - pip install -e ".[test]"
+script:
+  # 단위 테스트만 자동 실행. 통합 테스트는 자격증명이 필요해 수동.
+  - python -m unittest test.test_unit
