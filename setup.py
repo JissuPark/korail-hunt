@@ -63,6 +63,8 @@ setup(
     extras_require={
         # korail.py 헌팅 스크립트에서 .env 파일을 자동 로드하고 싶을 때
         'hunt': ['python-dotenv'],
+        # bot.py 텔레그램 봇
+        'bot': ['python-telegram-bot>=21', 'python-dotenv'],
         # 테스트
         'test': ['python-dotenv'],
     },
