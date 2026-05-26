@@ -70,6 +70,7 @@ KEY_SELECTED_TRAIN_IDX = 'sel'
 
 # context.bot_data 키
 KEY_KORAIL = 'korail'
+KEY_KORAIL_LOCK = 'korail_lock'  # 모든 코레일 호출 직렬화용 asyncio.Lock
 KEY_HUNT_TASKS = 'hunt_tasks'  # chat_id -> asyncio.Task
 
 
@@ -162,10 +163,21 @@ def restricted(func):
 # 공용
 # ---------------------------------------------------------------------------
 
-async def _ensure_login(korail: Korail):
-    """logined 플래그가 꺼져 있으면 재로그인. 만료된 세션은 여기서 회복된다."""
-    if not korail.logined:
-        await asyncio.to_thread(korail.login)
+async def _korail_call(context: ContextTypes.DEFAULT_TYPE, fn, *args, **kwargs):
+    """모든 코레일 호출은 이 헬퍼를 통해 직렬화. requests.Session 이
+    thread-safe 하지 않아 동시 헌팅 N개가 cookie jar 등을 손상시키는 걸
+    막는다."""
+    async with context.bot_data[KEY_KORAIL_LOCK]:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+async def _ensure_login(context: ContextTypes.DEFAULT_TYPE):
+    """logined 플래그가 꺼져 있으면 재로그인. 검사+로그인을 같은 lock 안에서
+    수행해서 동시에 두 코루틴이 둘 다 login() 을 호출하는 경쟁을 막는다."""
+    korail = context.bot_data[KEY_KORAIL]
+    async with context.bot_data[KEY_KORAIL_LOCK]:
+        if not korail.logined:
+            await asyncio.to_thread(korail.login)
 
 
 # ---------------------------------------------------------------------------
@@ -195,9 +207,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @restricted
 async def cmd_reservations(update: Update, context: ContextTypes.DEFAULT_TYPE):
     korail: Korail = context.bot_data[KEY_KORAIL]
-    await _ensure_login(korail)
+    await _ensure_login(context)
     try:
-        rsvs = await asyncio.to_thread(korail.reservations)
+        rsvs = await _korail_call(context, korail.reservations)
     except KorailError as e:
         await update.message.reply_text(f"조회 실패: {e}")
         return
@@ -421,10 +433,10 @@ async def _show_trains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data[KEY_DATE]
     t = context.user_data[KEY_TIME]
 
-    await _ensure_login(korail)
+    await _ensure_login(context)
     try:
-        trains = await asyncio.to_thread(
-            korail.search_train, dep, arr, d, t, include_no_seats=True,
+        trains = await _korail_call(
+            context, korail.search_train, dep, arr, d, t, include_no_seats=True,
         )
     except NoResultsError:
         trains = []
@@ -521,9 +533,9 @@ async def conv_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await query.edit_message_text(f"예약 중... {train!r}")
-    await _ensure_login(korail)
+    await _ensure_login(context)
     try:
-        rsv = await asyncio.to_thread(korail.reserve, train, None, option, False)
+        rsv = await _korail_call(context, korail.reserve, train, None, option, False)
     except SoldOutError:
         # 검색 후 예약 직전에 매진 — 같은 열차로 헌팅 fallback.
         await update.effective_message.reply_text(
@@ -616,9 +628,9 @@ async def _hunt_loop(context, chat_id, hunt_id, label, dep, arr, d, t, interval)
         while True:
             attempts += 1
             try:
-                await _ensure_login(korail)
-                trains = await asyncio.to_thread(
-                    korail.search_train_allday, dep, arr, d, t,
+                await _ensure_login(context)
+                trains = await _korail_call(
+                    context, korail.search_train_allday, dep, arr, d, t,
                 )
             except NoResultsError:
                 await asyncio.sleep(interval)
@@ -634,8 +646,8 @@ async def _hunt_loop(context, chat_id, hunt_id, label, dep, arr, d, t, interval)
                 continue
 
             try:
-                rsv = await asyncio.to_thread(
-                    korail.reserve, trains[0], None, ReserveOption.GENERAL_FIRST, False,
+                rsv = await _korail_call(
+                    context, korail.reserve, trains[0], None, ReserveOption.GENERAL_FIRST, False,
                 )
             except SoldOutError:
                 await asyncio.sleep(interval)
@@ -698,9 +710,9 @@ async def _train_hunt_loop(context, chat_id, hunt_id, label, target, dep, arr, d
         while True:
             attempts += 1
             try:
-                await _ensure_login(korail)
-                trains = await asyncio.to_thread(
-                    korail.search_train, dep, arr, d, t, include_no_seats=True,
+                await _ensure_login(context)
+                trains = await _korail_call(
+                    context, korail.search_train, dep, arr, d, t, include_no_seats=True,
                 )
             except NoResultsError:
                 await asyncio.sleep(interval)
@@ -725,7 +737,7 @@ async def _train_hunt_loop(context, chat_id, hunt_id, label, target, dep, arr, d
                 continue
 
             try:
-                rsv = await asyncio.to_thread(korail.reserve, match, None, option, False)
+                rsv = await _korail_call(context, korail.reserve, match, None, option, False)
             except SoldOutError:
                 await asyncio.sleep(interval)
                 continue
@@ -781,6 +793,7 @@ def main():
 
     app = Application.builder().token(token).build()
     app.bot_data[KEY_KORAIL] = korail
+    app.bot_data[KEY_KORAIL_LOCK] = asyncio.Lock()
     app.bot_data[KEY_HUNT_TASKS] = {}
 
     # 콜백 패턴을 명시해서 ConversationHandler 가 자기 화면의 콜백만 잡도록.
