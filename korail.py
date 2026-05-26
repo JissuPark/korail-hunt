@@ -21,6 +21,13 @@ import os
 import sys
 import time
 
+# 사내 프록시/백신의 SSL 인스펙션 환경에서도 동작하도록 OS 인증서 저장소 사용.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
 try:
     from dotenv import load_dotenv
     load_dotenv()

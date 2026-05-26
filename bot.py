@@ -20,6 +20,14 @@ import os
 from datetime import date, timedelta
 from functools import wraps
 
+# 시스템 인증서 저장소(Windows/macOS) 사용. 사내 프록시·백신이 SSL 검사를
+# 하는 환경에서 certifi 번들로는 실패하므로 OS 저장소로 우회한다.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
 try:
     from dotenv import load_dotenv
     load_dotenv()

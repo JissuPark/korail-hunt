@@ -61,10 +61,11 @@ setup(
         'pycryptodome',
     ],
     extras_require={
-        # korail.py 헌팅 스크립트에서 .env 파일을 자동 로드하고 싶을 때
-        'hunt': ['python-dotenv'],
+        # korail.py 헌팅 스크립트에서 .env 파일을 자동 로드하고 싶을 때.
+        # truststore 는 사내 프록시/백신의 SSL 인스펙션 환경에서 필요.
+        'hunt': ['python-dotenv', 'truststore'],
         # bot.py 텔레그램 봇
-        'bot': ['python-telegram-bot>=21', 'python-dotenv'],
+        'bot': ['python-telegram-bot>=21', 'python-dotenv', 'truststore'],
         # 테스트
         'test': ['python-dotenv'],
     },
