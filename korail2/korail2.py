@@ -514,7 +514,12 @@ class Korail:
         # 세션과 멤버 정보를 공유하는 버그가 있었다.
         self._session = requests.session()
         user_agent = os.environ.get('KORAIL_USER_AGENT', DEFAULT_USER_AGENT)
-        self._session.headers.update({'User-Agent': user_agent})
+        self._session.headers.update({
+            'User-Agent': user_agent,
+            'Accept-Language': 'ko-KR',
+        })
+        # 'AD'(Android) 가 거부될 경우 'iOS' 등으로 바꿔볼 수 있게 오버라이드 허용.
+        self._device = os.environ.get('KORAIL_DEVICE', self._device)
         self._key = 'korail1234567890'
         self._idx = None
 
