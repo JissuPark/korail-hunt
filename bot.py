@@ -210,58 +210,205 @@ async def cmd_reservations(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @restricted
 async def cmd_hunt_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tasks = context.bot_data.setdefault(KEY_HUNT_TASKS, {})
     chat_id = update.effective_chat.id
-    task = tasks.pop(chat_id, None)
-    if task is None or task.done():
+    active = _active_hunts(context, chat_id)
+    if not active:
         await update.message.reply_text("진행 중인 헌팅 없음")
         return
-    task.cancel()
-    await update.message.reply_text("헌팅 중단 요청")
+
+    # 1개면 바로 중단. 중단 메시지는 헌팅 루프의 CancelledError 핸들러가 보낸다.
+    if len(active) == 1:
+        next(iter(active.values()))['task'].cancel()
+        return
+
+    rows = []
+    for hid, entry in active.items():
+        rows.append([InlineKeyboardButton(f"[{hid}] {entry['label']}", callback_data=f"stop:{hid}")])
+    rows.append([InlineKeyboardButton("⛔ 전부 중단", callback_data="stop:all")])
+    rows.append([InlineKeyboardButton("닫기", callback_data="stop:close")])
+    await update.message.reply_text(
+        f"중단할 헌팅 선택 ({len(active)}개 진행 중):",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def cb_hunt_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/hunt_stop UI 의 'stop:*' 콜백. ConversationHandler 외부에 등록된다."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    target = query.data.split(":", 1)[1]
+
+    if target == "close":
+        await query.edit_message_text("(닫힘)")
+        return
+
+    active = _active_hunts(context, chat_id)
+    if not active:
+        await query.edit_message_text("진행 중인 헌팅 없음")
+        return
+
+    if target == "all":
+        for entry in active.values():
+            entry['task'].cancel()
+        await query.edit_message_text(f"전체 헌팅 ({len(active)}개) 중단 요청")
+        return
+
+    entry = active.get(target)
+    if entry is None:
+        await query.edit_message_text(f"[{target}] 없음 (이미 끝났을 수 있음)")
+        return
+    entry['task'].cancel()
+    await query.edit_message_text(f"[{target}] 중단 요청")
 
 
 # ---------------------------------------------------------------------------
 # Conversation: /reserve 흐름
 # ---------------------------------------------------------------------------
 
+WEEKDAY_KO = ['월', '화', '수', '목', '금', '토', '일']
+DATE_OFFSETS = [0, 1, 2, 3, 4, 5, 6, 7, 14, 21, 28]
+DATE_ALIASES = {0: '오늘', 1: '내일', 2: '모레'}
+
+POPULAR_STATIONS = [
+    '서울', '용산', '광명', '청량리',
+    '수원', '천안아산', '오송', '대전',
+    '동대구', '부산', '광주송정', '목포',
+    '여수EXPO', '영주', '안동', '강릉',
+]
+
+
+def _station_keyboard(prefix):
+    rows = []
+    for i in range(0, len(POPULAR_STATIONS), 4):
+        rows.append([
+            InlineKeyboardButton(s, callback_data=f"{prefix}:{s}")
+            for s in POPULAR_STATIONS[i:i + 4]
+        ])
+    rows.append([
+        InlineKeyboardButton("직접 입력", callback_data=f"{prefix}:_text"),
+        InlineKeyboardButton("취소", callback_data="cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _date_keyboard(today=None):
+    if today is None:
+        today = date.today()
+    rows, row = [], []
+    for offset in DATE_OFFSETS:
+        d = today + timedelta(days=offset)
+        prefix = DATE_ALIASES.get(offset, f"+{offset}")
+        label = f"{prefix} {d.month}/{d.day}({WEEKDAY_KO[d.weekday()]})"
+        row.append(InlineKeyboardButton(label, callback_data=f"date:{d.strftime('%Y%m%d')}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("취소", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _time_keyboard():
+    rows, row = [], []
+    for h in range(24):
+        row.append(InlineKeyboardButton(f"{h:02d}시", callback_data=f"time:{h:02d}0000"))
+        if len(row) == 6:
+            rows.append(row)
+            row = []
+    rows.append([InlineKeyboardButton("취소", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
 @restricted
 async def conv_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text(
-        "출발일을 입력하라.\n예: 20260601 · 오늘 · 내일 · 모레 · +7"
-    )
+    await update.message.reply_text("출발일 선택:", reply_markup=_date_keyboard())
     return ASK_DATE
 
 
 async def conv_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        context.user_data[KEY_DATE] = parse_date(update.message.text)
-    except ValueError as e:
-        await update.message.reply_text(f"{e}\n다시 입력하라.")
+    query = update.callback_query
+    await query.answer()
+    if query.data == "cancel":
+        await query.edit_message_text("취소됨.")
+        return ConversationHandler.END
+    if not query.data.startswith("date:"):
         return ASK_DATE
-    await update.message.reply_text(
-        f"출발 시각을 입력하라.\n예: 1000 · 10:00 · 100000"
+    ymd = query.data.split(":", 1)[1]
+    context.user_data[KEY_DATE] = ymd
+    await query.edit_message_text(
+        f"출발일: {ymd[:4]}-{ymd[4:6]}-{ymd[6:]}\n\n출발 시각 선택 (이 시각 이후 열차 검색):",
+        reply_markup=_time_keyboard(),
     )
     return ASK_TIME
 
 
 async def conv_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        context.user_data[KEY_TIME] = parse_time(update.message.text)
-    except ValueError as e:
-        await update.message.reply_text(f"{e}\n다시 입력하라.")
+    query = update.callback_query
+    await query.answer()
+    if query.data == "cancel":
+        await query.edit_message_text("취소됨.")
+        return ConversationHandler.END
+    if not query.data.startswith("time:"):
         return ASK_TIME
-    await update.message.reply_text("출발역을 입력하라. 예: 서울")
+    hhmmss = query.data.split(":", 1)[1]
+    context.user_data[KEY_TIME] = hhmmss
+    await query.edit_message_text(
+        f"출발 시각: {hhmmss[:2]}:00 이후\n\n출발역 선택:",
+        reply_markup=_station_keyboard("dep"),
+    )
     return ASK_DEP
 
 
 async def conv_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "cancel":
+        await query.edit_message_text("취소됨.")
+        return ConversationHandler.END
+    if query.data == "dep:_text":
+        await query.edit_message_text("출발역 이름을 입력하라. 예: 서울")
+        return ASK_DEP
+    if not query.data.startswith("dep:"):
+        return ASK_DEP
+    station = query.data.split(":", 1)[1]
+    context.user_data[KEY_DEP] = station
+    await query.edit_message_text(
+        f"출발역: {station}\n\n도착역 선택:",
+        reply_markup=_station_keyboard("arr"),
+    )
+    return ASK_ARR
+
+
+async def conv_dep_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[KEY_DEP] = update.message.text.strip()
-    await update.message.reply_text("도착역을 입력하라. 예: 부산")
+    await update.message.reply_text(
+        f"출발역: {context.user_data[KEY_DEP]}\n\n도착역 선택:",
+        reply_markup=_station_keyboard("arr"),
+    )
     return ASK_ARR
 
 
 async def conv_arr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "cancel":
+        await query.edit_message_text("취소됨.")
+        return ConversationHandler.END
+    if query.data == "arr:_text":
+        await query.edit_message_text("도착역 이름을 입력하라. 예: 부산")
+        return ASK_ARR
+    if not query.data.startswith("arr:"):
+        return ASK_ARR
+    station = query.data.split(":", 1)[1]
+    context.user_data[KEY_ARR] = station
+    await query.edit_message_text(f"도착역: {station}\n\n열차 검색 중...")
+    return await _show_trains(update, context)
+
+
+async def conv_arr_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[KEY_ARR] = update.message.text.strip()
     return await _show_trains(update, context)
 
@@ -300,11 +447,12 @@ async def _show_trains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_lines = [f"{dep} → {arr} {d} {t}", ""]
     buttons = []
     for i, tr in enumerate(trains):
-        text_lines.append(f"[{i + 1}] {tr!r}")
-        if tr.has_seat():
-            buttons.append([InlineKeyboardButton(f"#{i + 1} 선택", callback_data=f"train:{i}")])
+        marker = "" if tr.has_seat() else " (매진)"
+        text_lines.append(f"[{i + 1}] {tr!r}{marker}")
+        label = f"#{i + 1} 선택" if tr.has_seat() else f"#{i + 1} 헌팅"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"train:{i}")])
     buttons.append([
-        InlineKeyboardButton("🔁 헌팅", callback_data="hunt"),
+        InlineKeyboardButton("🔁 전체 헌팅", callback_data="hunt"),
         InlineKeyboardButton("취소", callback_data="cancel"),
     ])
     await update.effective_message.reply_text(
@@ -363,14 +511,25 @@ async def conv_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     option = getattr(ReserveOption, query.data.split(":", 1)[1])
     korail: Korail = context.bot_data[KEY_KORAIL]
-    train = context.user_data[KEY_TRAINS][context.user_data[KEY_SELECTED_TRAIN_IDX]]
+    train_idx = context.user_data[KEY_SELECTED_TRAIN_IDX]
+    train = context.user_data[KEY_TRAINS][train_idx]
+
+    # 매진 열차면 예약 시도 건너뛰고 즉시 해당 열차 헌팅 시작.
+    if not train.has_seat():
+        await query.edit_message_text(f"{train!r}\n좌석 없음 — 이 열차 헌팅 시작")
+        await _start_train_hunt(update, context, train_idx, option)
+        return ConversationHandler.END
 
     await query.edit_message_text(f"예약 중... {train!r}")
     await _ensure_login(korail)
     try:
         rsv = await asyncio.to_thread(korail.reserve, train, None, option, False)
     except SoldOutError:
-        await update.effective_message.reply_text("매진. /reserve 로 다시 시도하라.")
+        # 검색 후 예약 직전에 매진 — 같은 열차로 헌팅 fallback.
+        await update.effective_message.reply_text(
+            f"{train!r}\n예약 직전 매진 — 이 열차 헌팅 시작"
+        )
+        await _start_train_hunt(update, context, train_idx, option)
         return ConversationHandler.END
     except KorailError as e:
         await update.effective_message.reply_text(f"예약 실패: {e}")
@@ -399,13 +558,36 @@ async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # 헌팅 백그라운드
 # ---------------------------------------------------------------------------
+# bot_data[KEY_HUNT_TASKS] = {chat_id: {hunt_id: {'task': Task, 'label': str}}}
+# hunt_id 는 chat 단위로 'h1', 'h2', ... 자동 발급. 한 chat 에서 동시 다수 헌팅 가능.
+
+def _chat_hunts(context, chat_id):
+    return context.bot_data.setdefault(KEY_HUNT_TASKS, {}).setdefault(chat_id, {})
+
+
+def _next_hunt_id(chat_hunts):
+    n = 1
+    while f"h{n}" in chat_hunts:
+        n += 1
+    return f"h{n}"
+
+
+def _format_hunt_label(dep, arr, d, t, train=None):
+    date_str = f"{d[4:6]}/{d[6:]}"
+    if train is not None:
+        time_str = f"{train.dep_time[:2]}:{train.dep_time[2:4]}"
+        return f"[{train.train_type_name} {train.train_no}] {dep}→{arr} {date_str} {time_str}"
+    time_str = f"{t[:2]}:{t[2:4]}"
+    return f"전체 {dep}→{arr} {date_str} {time_str}~"
+
+
+def _active_hunts(context, chat_id):
+    return {hid: e for hid, e in _chat_hunts(context, chat_id).items() if not e['task'].done()}
+
 
 async def _start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    tasks = context.bot_data.setdefault(KEY_HUNT_TASKS, {})
-    if chat_id in tasks and not tasks[chat_id].done():
-        await update.effective_message.reply_text("이미 헌팅 중. /hunt_stop 으로 중단 가능")
-        return
+    chat_hunts = _chat_hunts(context, chat_id)
 
     dep = context.user_data[KEY_DEP]
     arr = context.user_data[KEY_ARR]
@@ -413,18 +595,20 @@ async def _start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = context.user_data[KEY_TIME]
     interval = float(os.environ.get('TELEGRAM_HUNT_INTERVAL', '3'))
 
+    hunt_id = _next_hunt_id(chat_hunts)
+    label = _format_hunt_label(dep, arr, d, t, train=None)
+
     await update.effective_message.reply_text(
-        f"헌팅 시작: {dep} → {arr} {d} {t} (간격 {interval}s)\n"
-        f"좌석이 잡히면 자동으로 예약한다. /hunt_stop 으로 중단."
+        f"[{hunt_id}] {label}\n전체 헌팅 시작 (간격 {interval}s). /hunt_stop 으로 중단."
     )
 
     task = asyncio.create_task(
-        _hunt_loop(context, chat_id, dep, arr, d, t, interval)
+        _hunt_loop(context, chat_id, hunt_id, label, dep, arr, d, t, interval)
     )
-    tasks[chat_id] = task
+    chat_hunts[hunt_id] = {'task': task, 'label': label}
 
 
-async def _hunt_loop(context, chat_id, dep, arr, d, t, interval):
+async def _hunt_loop(context, chat_id, hunt_id, label, dep, arr, d, t, interval):
     korail: Korail = context.bot_data[KEY_KORAIL]
     bot = context.bot
     attempts = 0
@@ -440,12 +624,12 @@ async def _hunt_loop(context, chat_id, dep, arr, d, t, interval):
                 await asyncio.sleep(interval)
                 continue
             except KorailError as e:
-                logger.warning("hunt search: %s", e)
-                korail.logined = False  # 다음 사이클에서 재로그인
+                logger.warning("hunt[%s] search: %s", hunt_id, e)
+                korail.logined = False
                 await asyncio.sleep(interval)
                 continue
             except Exception:
-                logger.exception("hunt unexpected")
+                logger.exception("hunt[%s] unexpected", hunt_id)
                 await asyncio.sleep(interval)
                 continue
 
@@ -454,32 +638,119 @@ async def _hunt_loop(context, chat_id, dep, arr, d, t, interval):
                     korail.reserve, trains[0], None, ReserveOption.GENERAL_FIRST, False,
                 )
             except SoldOutError:
-                # 검색 후 사이에 매진 — 다시 돌린다
                 await asyncio.sleep(interval)
                 continue
             except KorailError as e:
-                await bot.send_message(chat_id, f"헌팅 중 예약 실패: {e}")
+                await bot.send_message(chat_id, f"[{hunt_id}] 예약 실패: {e}")
                 return
 
             if rsv is None:
                 await bot.send_message(
                     chat_id,
-                    "예약 시도했지만 응답 해석 실패. /reservations 로 확인하라.",
+                    f"[{hunt_id}] 예약 시도했지만 응답 해석 실패. /reservations 확인.",
                 )
                 return
 
             await bot.send_message(
                 chat_id,
-                f"🎉 헌팅 성공 ({attempts}회 시도)\n\n{format_reservation_success(rsv)}",
+                f"🎉 [{hunt_id}] {label}\n헌팅 성공 ({attempts}회 시도)\n\n{format_reservation_success(rsv)}",
                 parse_mode=ParseMode.HTML,
             )
             return
     except asyncio.CancelledError:
-        await bot.send_message(chat_id, f"헌팅 중단 ({attempts}회 시도)")
+        await bot.send_message(chat_id, f"[{hunt_id}] 헌팅 중단 ({attempts}회 시도)")
         raise
     finally:
-        tasks = context.bot_data.get(KEY_HUNT_TASKS, {})
-        tasks.pop(chat_id, None)
+        _chat_hunts(context, chat_id).pop(hunt_id, None)
+
+
+async def _start_train_hunt(update, context, train_idx, option):
+    """특정 열차 한 대만 노린 헌팅. 검색 후 매진 떴을 때 진입."""
+    chat_id = update.effective_chat.id
+    chat_hunts = _chat_hunts(context, chat_id)
+
+    train = context.user_data[KEY_TRAINS][train_idx]
+    target = (train.train_no, train.dep_date, train.dep_time)
+    dep = context.user_data[KEY_DEP]
+    arr = context.user_data[KEY_ARR]
+    d = context.user_data[KEY_DATE]
+    t = context.user_data[KEY_TIME]
+    interval = float(os.environ.get('TELEGRAM_HUNT_INTERVAL', '3'))
+
+    hunt_id = _next_hunt_id(chat_hunts)
+    label = _format_hunt_label(dep, arr, d, t, train=train)
+
+    await update.effective_message.reply_text(
+        f"[{hunt_id}] {label}\n옵션: {option}, 간격 {interval}s. /hunt_stop 으로 중단."
+    )
+
+    task = asyncio.create_task(
+        _train_hunt_loop(context, chat_id, hunt_id, label, target, dep, arr, d, t, option, interval)
+    )
+    chat_hunts[hunt_id] = {'task': task, 'label': label}
+
+
+async def _train_hunt_loop(context, chat_id, hunt_id, label, target, dep, arr, d, t, option, interval):
+    korail: Korail = context.bot_data[KEY_KORAIL]
+    bot = context.bot
+    attempts = 0
+    try:
+        while True:
+            attempts += 1
+            try:
+                await _ensure_login(korail)
+                trains = await asyncio.to_thread(
+                    korail.search_train, dep, arr, d, t, include_no_seats=True,
+                )
+            except NoResultsError:
+                await asyncio.sleep(interval)
+                continue
+            except KorailError as e:
+                logger.warning("train hunt[%s] search: %s", hunt_id, e)
+                korail.logined = False
+                await asyncio.sleep(interval)
+                continue
+            except Exception:
+                logger.exception("train hunt[%s] unexpected", hunt_id)
+                await asyncio.sleep(interval)
+                continue
+
+            match = next(
+                (tr for tr in trains
+                 if (tr.train_no, tr.dep_date, tr.dep_time) == target),
+                None,
+            )
+            if match is None or not match.has_seat():
+                await asyncio.sleep(interval)
+                continue
+
+            try:
+                rsv = await asyncio.to_thread(korail.reserve, match, None, option, False)
+            except SoldOutError:
+                await asyncio.sleep(interval)
+                continue
+            except KorailError as e:
+                await bot.send_message(chat_id, f"[{hunt_id}] 예약 실패: {e}")
+                return
+
+            if rsv is None:
+                await bot.send_message(
+                    chat_id,
+                    f"[{hunt_id}] 예약 시도했지만 응답 해석 실패. /reservations 확인.",
+                )
+                return
+
+            await bot.send_message(
+                chat_id,
+                f"🎉 [{hunt_id}] {label}\n열차 헌팅 성공 ({attempts}회 시도)\n\n{format_reservation_success(rsv)}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+    except asyncio.CancelledError:
+        await bot.send_message(chat_id, f"[{hunt_id}] 열차 헌팅 중단 ({attempts}회 시도)")
+        raise
+    finally:
+        _chat_hunts(context, chat_id).pop(hunt_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -512,15 +783,23 @@ def main():
     app.bot_data[KEY_KORAIL] = korail
     app.bot_data[KEY_HUNT_TASKS] = {}
 
+    # 콜백 패턴을 명시해서 ConversationHandler 가 자기 화면의 콜백만 잡도록.
+    # 그래야 '/hunt_stop' 의 stop:* 콜백이 대화 도중에도 안전히 외부 핸들러로 흐른다.
     conv = ConversationHandler(
         entry_points=[CommandHandler('reserve', conv_start)],
         states={
-            ASK_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_date)],
-            ASK_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_time)],
-            ASK_DEP: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_dep)],
-            ASK_ARR: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_arr)],
-            SELECT_TRAIN: [CallbackQueryHandler(conv_train_pick)],
-            SELECT_OPTION: [CallbackQueryHandler(conv_option)],
+            ASK_DATE: [CallbackQueryHandler(conv_date, pattern=r"^(date:|cancel$)")],
+            ASK_TIME: [CallbackQueryHandler(conv_time, pattern=r"^(time:|cancel$)")],
+            ASK_DEP: [
+                CallbackQueryHandler(conv_dep, pattern=r"^(dep:|cancel$)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_dep_text),
+            ],
+            ASK_ARR: [
+                CallbackQueryHandler(conv_arr, pattern=r"^(arr:|cancel$)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_arr_text),
+            ],
+            SELECT_TRAIN: [CallbackQueryHandler(conv_train_pick, pattern=r"^(train:|hunt$|cancel$)")],
+            SELECT_OPTION: [CallbackQueryHandler(conv_option, pattern=r"^(opt:|cancel$)")],
         },
         fallbacks=[CommandHandler('cancel', conv_cancel)],
     )
@@ -529,6 +808,7 @@ def main():
     app.add_handler(CommandHandler('help', cmd_help))
     app.add_handler(CommandHandler('reservations', cmd_reservations))
     app.add_handler(CommandHandler('hunt_stop', cmd_hunt_stop))
+    app.add_handler(CallbackQueryHandler(cb_hunt_stop, pattern=r"^stop:"))
     app.add_handler(conv)
 
     logger.info("봇 시작 (인증 chat_id=%s)", authorized_chat_id())
