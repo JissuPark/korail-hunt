@@ -50,6 +50,7 @@ from korail2 import (
     Korail,
     KorailError,
     NoResultsError,
+    PatchedKorail,
     ReserveOption,
     SoldOutError,
 )
@@ -503,7 +504,7 @@ def main():
     if not (korail_id and korail_pw):
         raise SystemExit("KORAIL_ID/KORAIL_PW 환경변수가 필요하다 (.env 확인)")
 
-    korail = Korail(korail_id, korail_pw, auto_login=False)
+    korail = PatchedKorail(korail_id, korail_pw, auto_login=False)
     if not korail.login():
         raise SystemExit("코레일 로그인 실패 — 자격증명을 확인하라")
 

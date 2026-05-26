@@ -10,7 +10,10 @@ import itertools
 import json
 import logging
 import os
+import random
 import re
+import string
+import time
 from datetime import datetime, timedelta, timezone
 from functools import reduce
 
@@ -50,7 +53,19 @@ KORAIL_PAYMENT_VOUCHER = "%s/ebizmw/PrdPkgBoucherView.do" % KORAIL_DOMAIN
 KORAIL_CODE = "%s.common.code.do" % KORAIL_MOBILE
 
 # 코레일이 너무 오래된 UA 를 매크로로 판정한다. 환경변수 KORAIL_USER_AGENT 로 오버라이드 가능.
-DEFAULT_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 14; SM-S928N Build/UP1A.231005.007)"
+# Android 13 빌드 문자열은 NomaDamas/k-skill 가 MACRO ERROR 우회에 사용해 검증된 값.
+DEFAULT_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 13; SM-S928N Build/UP1A.231005.007)"
+
+# DynaPath anti-bot 체크가 적용되는 엔드포인트 경로. 이 경로들에는 매 요청마다
+# x-dynapath-m-token 헤더와 Sid 폼 필드를 주입해야 한다.
+DYNAPATH_PATHS = [
+    "/classes/com.korail.mobile.certification.TicketReservation",
+    "/classes/com.korail.mobile.nonMember.NonMemTicket",
+    "/classes/com.korail.mobile.seatMovie.ScheduleView",
+    "/classes/com.korail.mobile.seatMovie.ScheduleViewSpecial",
+    "/classes/com.korail.mobile.trn.prcFare.do",
+    "/classes/com.korail.mobile.login.Login",
+]
 
 
 class Schedule:
@@ -978,3 +993,348 @@ there are 4 options in ReserveOption class.
         j = json.loads(r.text)
         if self._result_check(j):
             return True
+
+
+# ---------------------------------------------------------------------------
+# DynaPath anti-bot 우회
+# ---------------------------------------------------------------------------
+# 코레일이 모바일 표면에 적용한 Dynapath anti-bot 체크 때문에 plain Korail 호출은
+# MACRO ERROR 로 거부된다. NomaDamas/k-skill (MIT) 가 공개한 우회 알고리즘을
+# 그대로 포팅했다. anti-bot 규칙이 또 바뀌면 이 코드도 같이 손봐야 한다.
+class DynaPathMasterEngine:
+    APP_ID = "com.korail.talk"
+    AS_VALUE = "%5B38ff229cb34c7dda8e28220a2d750cce%5D"
+    DEVICE_MODEL = "SM-S928N"
+    OS_TYPE = "Android"
+    SDK_VERSION = "v1"
+
+    def __init__(self):
+        self.table = "3FE9jgRD4KdCyuawklqGJYmvfMn15P7US8XbxeLQtWT6OicBAopINs2Vh0HZrz"
+        self.i8 = 161
+        self.i9 = 30
+        self.i10 = 2
+        self.app_start_ts = str(int(time.time() * 1000))
+
+    def string2xa1s(self, data):
+        result = []
+        idx = 0
+        while idx < len(data):
+            codepoint = ord(data[idx])
+            idx += 1
+            if codepoint < 128:
+                result.append(codepoint)
+            elif codepoint < 2048:
+                result.append(128 | ((codepoint >> 7) & 15))
+                result.append(codepoint & 127)
+            elif codepoint >= 262144:
+                result.append(160)
+                result.append((codepoint >> 14) & 127)
+                result.append((codepoint >> 7) & 127)
+                result.append(codepoint & 127)
+            elif (63488 & codepoint) != 55296:
+                result.append(((codepoint >> 14) & 15) | 144)
+                result.append((codepoint >> 7) & 127)
+                result.append(codepoint & 127)
+        return result
+
+    def make_key(self, key):
+        total = 0
+        for char in key:
+            codepoint = ord(char)
+            bit = 32768
+            for _ in range(16):
+                if bit & codepoint:
+                    break
+                bit >>= 1
+            total = (total * (bit << 1)) + codepoint
+        return total
+
+    def internal_char(self, base_table, remainder, current):
+        seen = 0
+        for char in base_table:
+            if char in current:
+                continue
+            if seen == remainder:
+                return char
+            seen += 1
+        return " "
+
+    def make_encode_table(self, number, encode_size, base_table):
+        chars = ""
+        temp = number
+        for index in range(encode_size):
+            divisor = encode_size - index
+            remainder = temp % divisor
+            chars += self.internal_char(base_table, remainder, chars)
+            temp //= divisor
+        return chars
+
+    def encode_normal_be(self, data, table):
+        values = self.string2xa1s(data)
+        output = []
+        digits = [0] * (self.i10 + 1)
+        idx = 0
+        tail = len(values) % self.i10
+        body_size = len(values) - tail
+        while idx < body_size:
+            value = 0
+            for _ in range(self.i10):
+                value = (value * self.i8) + values[idx]
+                idx += 1
+            for digit_index in range(self.i10 + 1):
+                digits[digit_index] = value % self.i9
+                value //= self.i9
+            for digit_index in range(self.i10, -1, -1):
+                output.append(table[digits[digit_index]])
+        if tail > 0:
+            value = 0
+            for _ in range(tail):
+                value = (value * self.i8) + values[idx]
+                idx += 1
+            for digit_index in range(tail + 1):
+                digits[digit_index] = value % self.i9
+                value //= self.i9
+            while tail >= 0:
+                output.append(table[digits[tail]])
+                tail -= 1
+        return "".join(output)
+
+    def generate_token(self, device_id, timestamp_ms, nonce):
+        plaintext = (
+            f"ai={self.APP_ID}&di={device_id}&as={self.AS_VALUE}&su=false&dbg=false&emu=false&hk=false"
+            f"&it={self.app_start_ts}&ts={timestamp_ms}&rt=0&os=13&dm={self.DEVICE_MODEL}&st={self.OS_TYPE}&sv={self.SDK_VERSION}"
+        )
+        dyn_key = f"v1+{nonce}+{timestamp_ms}"
+        key_encoded = self.encode_normal_be(dyn_key, self.table)
+        encode_table = self.make_encode_table(self.make_key(dyn_key), self.i9, self.table)
+        body_encoded = self.encode_normal_be(plaintext, encode_table)
+        return f"bEeEP{self.table[len(key_encoded)]}{key_encoded}{body_encoded}"
+
+
+class PatchedKorail(Korail):
+    """DynaPath anti-bot 우회가 적용된 Korail. plain Korail 은 MACRO ERROR 로 막힌다."""
+
+    _sid_key = b"2485dd54d9deaa36"
+    _device_id = "558a4f02041657ea"
+
+    def __init__(self, korail_id, korail_pw, auto_login=True, want_feedback=False):
+        super().__init__(korail_id, korail_pw, auto_login=False, want_feedback=want_feedback)
+        # k-skill 검증값: Device='AD'(Android) 고정, Version='250601002'.
+        # KORAIL_LOGIN_VERSION 환경변수로 오버라이드 가능 (anti-bot 규칙이 또 바뀔 때 대비).
+        self._device = 'AD'
+        # 빈 문자열도 default 로 떨어지도록 `or` 사용 (.env 의 빈 값 처리).
+        self._version = os.environ.get('KORAIL_LOGIN_VERSION') or '250601002'
+        self._engine = DynaPathMasterEngine()
+        if auto_login:
+            self.login(korail_id, korail_pw)
+
+    def _generate_sid(self, timestamp_ms):
+        plaintext = f"{self._device}{timestamp_ms}".encode("utf-8")
+        cipher = AES.new(self._sid_key, AES.MODE_CBC, iv=self._sid_key)
+        return base64.b64encode(cipher.encrypt(pad(plaintext, 16))).decode("utf-8") + "\n"
+
+    def _auth_headers_and_sid(self, url):
+        if not any(path in url for path in DYNAPATH_PATHS):
+            return {}, None
+        timestamp_ms = int(time.time() * 1000)
+        nonce = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        headers = {
+            "x-dynapath-m-token": self._engine.generate_token(self._device_id, timestamp_ms, nonce),
+        }
+        return headers, self._generate_sid(timestamp_ms)
+
+    def login(self, korail_id=None, korail_pw=None):
+        if korail_id is None:
+            korail_id = self.korail_id
+        else:
+            self.korail_id = korail_id
+        if korail_pw is None:
+            korail_pw = self.korail_pw
+        else:
+            self.korail_pw = korail_pw
+
+        if EMAIL_REGEX.match(korail_id):
+            txt_input_flg = '5'
+        elif PHONE_NUMBER_REGEX.match(korail_id):
+            txt_input_flg = '4'
+        else:
+            txt_input_flg = '2'
+
+        headers, sid = self._auth_headers_and_sid(KORAIL_LOGIN)
+        data = {
+            'Device': self._device,
+            'Version': self._version,
+            'txtInputFlg': txt_input_flg,
+            'txtMemberNo': korail_id,
+            'txtPwd': self._Korail__enc_password(korail_pw),
+            'idx': self._idx,
+        }
+        if sid:
+            data['Sid'] = sid
+
+        r = self._session.post(KORAIL_LOGIN, data=data, headers=headers)
+        j = json.loads(r.text)
+        if j['strResult'] == 'SUCC' and j.get('strMbCrdNo') is not None:
+            self._key = j['Key']
+            self.membership_number = j['strMbCrdNo']
+            self.name = j['strCustNm']
+            self.email = j['strEmailAdr']
+            self.logined = True
+            return True
+
+        logger.warning(
+            "로그인 실패: txtInputFlg=%s Version=%s strResult=%s "
+            "h_msg_cd=%s h_msg_txt=%s",
+            txt_input_flg, self._version, j.get('strResult'),
+            j.get('h_msg_cd'), j.get('h_msg_txt'),
+        )
+        self.logined = False
+        return False
+
+    def search_train(self, dep, arr, date=None, time=None, train_type=TrainType.ALL,
+                     passengers=None, include_no_seats=False, include_waiting_list=False):
+        kst_now = datetime.now(timezone.utc) + timedelta(hours=9)
+        if date is None:
+            date = kst_now.strftime("%Y%m%d")
+        if time is None:
+            time = kst_now.strftime("%H%M%S")
+        if passengers is None:
+            passengers = [AdultPassenger()]
+
+        passengers = Passenger.reduce(passengers)
+        adult_count = reduce(lambda total, p: total + p.count, [p for p in passengers if isinstance(p, AdultPassenger)], 0)
+        child_count = reduce(lambda total, p: total + p.count, [p for p in passengers if isinstance(p, ChildPassenger)], 0)
+        toddler_count = reduce(lambda total, p: total + p.count, [p for p in passengers if isinstance(p, ToddlerPassenger)], 0)
+        senior_count = reduce(lambda total, p: total + p.count, [p for p in passengers if isinstance(p, SeniorPassenger)], 0)
+
+        headers, sid = self._auth_headers_and_sid(KORAIL_SEARCH_SCHEDULE)
+        data = {
+            'Device': self._device,
+            'radJobId': '1',
+            'selGoTrain': train_type,
+            'txtCardPsgCnt': '0',
+            'txtGdNo': '',
+            'txtGoAbrdDt': date,
+            'txtGoEnd': arr,
+            'txtGoHour': time,
+            'txtGoStart': dep,
+            'txtJobDv': '',
+            'txtMenuId': '11',
+            'txtPsgFlg_1': adult_count,
+            'txtPsgFlg_2': child_count,
+            'txtPsgFlg_8': toddler_count,
+            'txtPsgFlg_3': senior_count,
+            'txtPsgFlg_4': '0',
+            'txtPsgFlg_5': '0',
+            'txtSeatAttCd_2': '000',
+            'txtSeatAttCd_3': '000',
+            'txtSeatAttCd_4': '015',
+            'txtTrnGpCd': train_type,
+            'Version': self._version,
+        }
+        if sid:
+            data['Sid'] = sid
+
+        r = self._session.post(KORAIL_SEARCH_SCHEDULE, params=data, headers=headers)
+        j = json.loads(r.text)
+        if self._result_check(j):
+            trains = [Train(info) for info in j['trn_infos']['trn_info']]
+            trains = [t for t in trains if t.dep_name == dep and t.arr_name == arr]
+            filters = [lambda t: t.has_seat()]
+            if include_no_seats:
+                filters.append(lambda t: not t.has_seat())
+            if include_waiting_list:
+                filters.append(lambda t: t.has_waiting_list())
+            trains = [t for t in trains if any(check(t) for check in filters)]
+            if not trains:
+                raise NoResultsError()
+            return trains
+
+    def reserve(self, train, passengers=None, option=ReserveOption.GENERAL_FIRST, try_waiting=False):
+        reserving_seat = True
+        try:
+            if not train.has_seat():
+                raise SoldOutError()
+            if option == ReserveOption.GENERAL_ONLY:
+                if train.has_general_seat():
+                    seat_type = '1'
+                else:
+                    raise SoldOutError()
+            elif option == ReserveOption.SPECIAL_ONLY:
+                if train.has_special_seat():
+                    seat_type = '2'
+                else:
+                    raise SoldOutError()
+            elif option == ReserveOption.GENERAL_FIRST:
+                seat_type = '1' if train.has_general_seat() else '2'
+            elif option == ReserveOption.SPECIAL_FIRST:
+                seat_type = '2' if train.has_special_seat() else '1'
+            else:
+                raise ValueError(f"unsupported reserve option: {option}")
+        except SoldOutError:
+            if try_waiting and option != ReserveOption.SPECIAL_ONLY and train.has_general_waiting_list():
+                reserving_seat = False
+                seat_type = '1'
+            else:
+                raise
+
+        if passengers is None:
+            passengers = [AdultPassenger()]
+        passengers = Passenger.reduce(passengers)
+        passenger_count = reduce(lambda total, p: total + p.count, passengers, 0)
+
+        headers, sid = self._auth_headers_and_sid(KORAIL_TICKETRESERVATION)
+        data = {
+            'Device': self._device,
+            'Version': self._version,
+            'Key': self._key,
+            'txtGdNo': '',
+            'txtJobId': '1101' if reserving_seat else '1102',
+            'txtTotPsgCnt': passenger_count,
+            'txtSeatAttCd1': '000',
+            'txtSeatAttCd2': '000',
+            'txtSeatAttCd3': '000',
+            'txtSeatAttCd4': '015',
+            'txtSeatAttCd5': '000',
+            'hidFreeFlg': 'N',
+            'txtStndFlg': 'N',
+            'txtMenuId': '11',
+            'txtSrcarCnt': '0',
+            'txtJrnyCnt': '1',
+            'txtJrnySqno1': '001',
+            'txtJrnyTpCd1': '11',
+            'txtDptDt1': train.dep_date,
+            'txtDptRsStnCd1': train.dep_code,
+            'txtDptTm1': train.dep_time,
+            'txtArvRsStnCd1': train.arr_code,
+            'txtTrnNo1': train.train_no,
+            'txtRunDt1': train.run_date,
+            'txtTrnClsfCd1': train.train_type,
+            'txtPsrmClCd1': seat_type,
+            'txtTrnGpCd1': train.train_group,
+            'txtChgFlg1': '',
+            'txtJrnySqno2': '',
+            'txtJrnyTpCd2': '',
+            'txtDptDt2': '',
+            'txtDptRsStnCd2': '',
+            'txtDptTm2': '',
+            'txtArvRsStnCd2': '',
+            'txtTrnNo2': '',
+            'txtRunDt2': '',
+            'txtTrnClsfCd2': '',
+            'txtPsrmClCd2': '',
+            'txtChgFlg2': '',
+        }
+        if sid:
+            data['Sid'] = sid
+        for index, passenger in enumerate(passengers, start=1):
+            data.update(passenger.get_dict(index))
+
+        r = self._session.get(KORAIL_TICKETRESERVATION, params=data, headers=headers)
+        j = json.loads(r.text)
+        if self._result_check(j):
+            reservation_id = j['h_pnr_no']
+            matches = [rsv for rsv in self.reservations() if rsv.rsv_id == reservation_id]
+            if len(matches) == 1:
+                return matches[0]
+            raise KorailError(f"reservation {reservation_id} was created but could not be reloaded")
