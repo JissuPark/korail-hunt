@@ -49,7 +49,8 @@ KORAIL_PAYMENT_VOUCHER = "%s/ebizmw/PrdPkgBoucherView.do" % KORAIL_DOMAIN
 
 KORAIL_CODE = "%s.common.code.do" % KORAIL_MOBILE
 
-DEFAULT_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 5.1.1; Nexus 4 Build/LMY48T)"
+# 코레일이 너무 오래된 UA 를 매크로로 판정한다. 환경변수 KORAIL_USER_AGENT 로 오버라이드 가능.
+DEFAULT_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 14; SM-S928N Build/UP1A.231005.007)"
 
 
 class Schedule:
@@ -512,7 +513,8 @@ class Korail:
         # 인스턴스 단위 세션/키. 과거에는 클래스 속성이라 여러 Korail 인스턴스가
         # 세션과 멤버 정보를 공유하는 버그가 있었다.
         self._session = requests.session()
-        self._session.headers.update({'User-Agent': DEFAULT_USER_AGENT})
+        user_agent = os.environ.get('KORAIL_USER_AGENT', DEFAULT_USER_AGENT)
+        self._session.headers.update({'User-Agent': user_agent})
         self._key = 'korail1234567890'
         self._idx = None
 
