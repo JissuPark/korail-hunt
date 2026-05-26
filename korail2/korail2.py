@@ -8,6 +8,8 @@
 import base64
 import itertools
 import json
+import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from functools import reduce
@@ -15,6 +17,8 @@ from functools import reduce
 import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
+
+logger = logging.getLogger(__name__)
 
 EMAIL_REGEX = re.compile(r"[^@]+@[^@]+\.[^@]+")
 PHONE_NUMBER_REGEX = re.compile(r"(\d{3})-(\d{3,4})-(\d{4})")
@@ -544,6 +548,10 @@ class Korail:
 
             return base64.b64encode(base64.b64encode(cipher.encrypt(padded_data))).decode("utf-8")
         else:
+            logger.warning(
+                "비밀번호 암호화 키 발급 실패: strResult=%s h_msg_cd=%s h_msg_txt=%s",
+                j.get('strResult'), j.get('h_msg_cd'), j.get('h_msg_txt'),
+            )
             return False
 
     def login(self, korail_id=None, korail_pw=None):
@@ -590,10 +598,13 @@ When you want change ID using existing object,
         else:
             txt_input_flg = '2'
 
+        # 서버가 너무 오래된 클라이언트 버전을 거부한다. 환경변수로 오버라이드 가능.
+        login_version = os.environ.get('KORAIL_LOGIN_VERSION', '231231001')
+
         url = KORAIL_LOGIN
         data = {
             'Device': self._device,
-            'Version': '231231001',  # HACK: 서버가 구버전을 거부함
+            'Version': login_version,
             # 2 : for membership number,
             # 4 : for phone number,
             # 5 : for email,
@@ -612,8 +623,15 @@ When you want change ID using existing object,
             self.name = j['strCustNm']
             self.email = j['strEmailAdr']
             self.logined = True
+            logger.info("로그인 성공: %s (%s)", self.name, self.membership_number)
             return True
         else:
+            logger.warning(
+                "로그인 실패: txtInputFlg=%s Version=%s strResult=%s "
+                "h_msg_cd=%s h_msg_txt=%r",
+                txt_input_flg, login_version,
+                j.get('strResult'), j.get('h_msg_cd'), j.get('h_msg_txt'),
+            )
             self.logined = False
             return False
 

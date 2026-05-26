@@ -17,6 +17,7 @@ Korail 좌석 헌팅 스크립트.
 `.env` 로딩은 `python-dotenv` 가 설치돼 있을 때만 자동으로 일어난다.
 설치하지 않은 환경에서는 OS 환경변수를 그대로 사용한다.
 """
+import logging
 import os
 import sys
 import time
@@ -88,6 +89,11 @@ def hunt(korail, dep, arr, dep_date, dep_time, passengers, train_type, poll_inte
 
 
 def main():
+    logging.basicConfig(
+        format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+        level=logging.INFO,
+    )
+
     korail_id = _required_env("KORAIL_ID")
     korail_pw = _required_env("KORAIL_PW")
     dep = _required_env("DEP")
