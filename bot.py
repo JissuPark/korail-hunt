@@ -21,11 +21,14 @@ korail-hunt Telegram 봇 (멀티 유저).
   python bot.py
 """
 import asyncio
+import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from functools import wraps
+from typing import Optional
 
 # 시스템 인증서 저장소(Windows/macOS) 사용. 사내 프록시·백신이 SSL 검사를
 # 하는 환경에서 certifi 번들로는 실패하므로 OS 저장소로 우회한다.
@@ -41,7 +44,15 @@ try:
 except ImportError:
     pass
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+    WebAppInfo,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -97,7 +108,8 @@ class UserSession:
 
 
 def _get_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """현재 메모리에 있는 세션 반환. 없으면 storage 에서 만들어 캐싱."""
+    """현재 메모리에 있는 세션 반환. 없으면 storage 에서 만들어 캐싱.
+    저장된 device_info 가 있으면 함께 적용한다."""
     sessions = context.bot_data.setdefault(KEY_SESSIONS, {})
     if chat_id in sessions:
         return sessions[chat_id]
@@ -107,6 +119,7 @@ def _get_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         return None
     korail = PatchedKorail(creds['korail_id'], creds['korail_pw'], auto_login=False)
     session = UserSession(chat_id=chat_id, korail=korail)
+    _apply_device_info(session, creds.get('device_info'))
     sessions[chat_id] = session
     return session
 
@@ -121,6 +134,29 @@ async def _ensure_login(session: UserSession):
     async with session.lock:
         if not session.korail.logined:
             await asyncio.to_thread(session.korail.login)
+
+
+def _apply_device_info(session: UserSession, device_info: dict):
+    """저장된 device_info 를 Korail 세션에 적용. device_info=None 이면 건너뜀."""
+    if not device_info:
+        return
+    ua = device_info.get('user_agent')
+    code = device_info.get('device_code')
+    if ua:
+        session.korail._session.headers['User-Agent'] = ua
+    if code:
+        session.korail._device = code
+
+
+def _webapp_keyboard(label="📱 기기 정보 자동 감지"):
+    """기기 감지 WebApp 버튼이 달린 reply keyboard. URL 미설정 시 None."""
+    url = os.environ.get('TELEGRAM_WEBAPP_URL')
+    if not url:
+        return None
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(text=label, web_app=WebAppInfo(url=url))]],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +190,72 @@ def parse_time(text):
     if len(text) == 6 and text.isdigit():
         return text
     raise ValueError(f"시각 형식을 인식할 수 없음: {text!r}. HHMM / HHMMSS / HH:MM 사용")
+
+
+# ---------------------------------------------------------------------------
+# Device 정보 파서 (Telegram WebApp 에서 받아오는 UA 처리)
+# ---------------------------------------------------------------------------
+
+DEVICE_ANDROID = 'AD'
+DEVICE_IOS = 'iOS'
+
+# Linux; (U;) Android <ver>; <model>(; Build/<build>)?(; wv)? )
+_ANDROID_UA_RE = re.compile(
+    r'Linux;\s*(?:U;\s*)?Android\s+(?P<android>[\d.]+)[;\s]\s*(?P<model>[^;)]+?)'
+    r'(?:\s+Build/(?P<build>[^;)]+))?(?:\s*;\s*wv)?\s*\)',
+)
+
+# 안드로이드 메이저 버전별 합리적 default build 문자열 (UA 에 Build/ 가 없을 때 채워넣음)
+_DEFAULT_ANDROID_BUILDS = {
+    '15': 'AP3A.240905.015.A2',
+    '14': 'UP1A.231005.007',
+    '13': 'TP1A.220624.014',
+    '12': 'SP1A.210812.016',
+    '11': 'RP1A.200720.011',
+    '10': 'QP1A.190711.020',
+}
+
+
+@dataclass(frozen=True)
+class DeviceInfo:
+    """Korail 세션에 적용할 device 설정. dalvik_ua=None 이면 기본값 유지."""
+    platform: str                # 'android' / 'ios' / 'unknown'
+    dalvik_ua: Optional[str]
+    device_code: str             # 'AD' 또는 'iOS'
+
+    @property
+    def is_usable(self):
+        """Korail 에 실제로 적용할 만한 정보가 있는지."""
+        return self.dalvik_ua is not None or self.device_code == DEVICE_IOS
+
+
+def parse_device_info(webview_ua: str, platform: str = '') -> DeviceInfo:
+    """Telegram WebApp 의 navigator.userAgent + Telegram.WebApp.platform 을
+    Korail 호환 device 정보로 변환한다.
+
+    Android → UA 에서 모델/버전 추출해서 Dalvik UA 재조립.
+    iOS → device='iOS' 만 세팅, UA 는 기본값 유지 권장.
+    그 외(desktop/web) → unknown, 호출자가 default UA 사용.
+    """
+    platform = (platform or '').lower()
+    ua = webview_ua or ''
+    ua_lower = ua.lower()
+
+    if platform == 'ios' or 'iphone' in ua_lower or 'ipad' in ua_lower:
+        return DeviceInfo(platform='ios', dalvik_ua=None, device_code=DEVICE_IOS)
+
+    if platform in ('android', 'android_x') or 'android' in ua_lower:
+        m = _ANDROID_UA_RE.search(ua)
+        if not m:
+            return DeviceInfo(platform='android', dalvik_ua=None, device_code=DEVICE_ANDROID)
+        android_ver = m.group('android')
+        model = m.group('model').strip()
+        major = android_ver.split('.')[0]
+        build = m.group('build') or _DEFAULT_ANDROID_BUILDS.get(major, 'UP1A.231005.007')
+        dalvik = f"Dalvik/2.1.0 (Linux; U; Android {android_ver}; {model} Build/{build})"
+        return DeviceInfo(platform='android', dalvik_ua=dalvik, device_code=DEVICE_ANDROID)
+
+    return DeviceInfo(platform='unknown', dalvik_ua=None, device_code=DEVICE_ANDROID)
 
 
 def format_reservation_success(rsv):
@@ -246,6 +348,10 @@ HELP_TEXT = (
     "<b>헌팅</b>\n"
     "/hunts - 진행 중인 헌팅\n"
     "/hunt_stop - 헌팅 중단\n"
+    "\n"
+    "<b>기기 정보 (anti-bot 우회)</b>\n"
+    "/setdevice - 본인 휴대폰 UA 자동 감지 (WebApp)\n"
+    "/cleardevice - 저장된 기기 정보 삭제\n"
     "\n"
     "/cancel - 진행 중인 대화 취소\n"
     "/help - 도움말"
@@ -391,11 +497,132 @@ async def login_ask_pw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = UserSession(chat_id=update.effective_chat.id, korail=korail)
     context.bot_data.setdefault(KEY_SESSIONS, {})[update.effective_chat.id] = session
 
+    kb = _webapp_keyboard()
+    extra = (
+        "\n\n💡 매크로 감지 우회 정확도를 높이려면 아래 [기기 정보 자동 감지] 버튼을 한 번 눌러라. "
+        "본인 휴대폰의 User-Agent 를 그대로 사용한다."
+        if kb else ""
+    )
     await update.effective_message.reply_text(
         f"✅ 로그인 성공: {korail.name} ({korail.membership_number})\n"
-        f"자격증명이 암호화되어 저장됐다. /reserve 로 시작.",
+        f"자격증명이 암호화되어 저장됐다. /reserve 로 시작."
+        f"{extra}",
+        reply_markup=kb,
     )
     return ConversationHandler.END
+
+
+@restricted
+async def cmd_setdevice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """저장된 기기 정보를 갱신하거나 새로 받는다."""
+    chat_id = update.effective_chat.id
+    if _get_session(context, chat_id) is None:
+        await update.message.reply_text("먼저 /login 하라.")
+        return
+    kb = _webapp_keyboard()
+    if kb is None:
+        await update.message.reply_text(
+            "TELEGRAM_WEBAPP_URL 환경변수가 설정되어 있지 않다. "
+            "관리자가 봇 .env 에 WebApp 페이지 URL 을 추가해야 한다."
+        )
+        return
+    storage: EncryptedStorage = context.bot_data[KEY_STORAGE]
+    current = (storage.get_user(chat_id) or {}).get('device_info')
+    current_str = (
+        f"현재 저장: {current['platform']} / {current['device_code']} / "
+        f"<code>{current['user_agent'] or '(기본 UA)'}</code>"
+        if current else "현재 저장된 기기 정보 없음 (env 기본값 사용 중)"
+    )
+    await update.message.reply_text(
+        f"{current_str}\n\n"
+        f"아래 버튼을 누르면 본인 휴대폰 정보를 다시 받아온다.",
+        reply_markup=kb,
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@restricted
+async def cmd_cleardevice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """저장된 기기 정보를 지우고 env 기본값으로 돌아간다."""
+    chat_id = update.effective_chat.id
+    session = _get_session(context, chat_id)
+    if session is None:
+        await update.message.reply_text("먼저 /login 하라.")
+        return
+    storage: EncryptedStorage = context.bot_data[KEY_STORAGE]
+    try:
+        storage.set_user_device(chat_id)  # 다 None → 클리어
+    except KeyError:
+        pass
+    # 메모리 세션도 갱신 — 다음 세션 생성 시 env 기본값으로
+    context.bot_data.get(KEY_SESSIONS, {}).pop(chat_id, None)
+    await update.message.reply_text(
+        "기기 정보 삭제됨. 다음 호출부터 env 기본 UA 사용. /setdevice 로 다시 등록 가능.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@restricted
+async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """WebApp 에서 sendData() 로 보낸 device 정보를 받는다."""
+    chat_id = update.effective_chat.id
+    session = _get_session(context, chat_id)
+    if session is None:
+        await update.message.reply_text(
+            "먼저 /login 하라.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    raw = update.effective_message.web_app_data.data
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        await update.message.reply_text(f"WebApp 데이터 파싱 실패: {raw[:80]}")
+        return
+
+    if payload.get('type') != 'device_info':
+        await update.message.reply_text(f"알 수 없는 WebApp 메시지 타입: {payload.get('type')!r}")
+        return
+
+    info = parse_device_info(payload.get('user_agent', ''), payload.get('platform', ''))
+    if not info.is_usable:
+        await update.message.reply_text(
+            f"감지 결과: <b>{info.platform}</b>\n"
+            f"이 플랫폼에서는 Korail 호환 UA 를 만들 수 없다. "
+            f"휴대폰(Android/iOS)의 Telegram 에서 다시 시도하라.\n"
+            f"받은 UA: <code>{payload.get('user_agent', '')[:200]}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    # 메모리 세션에 즉시 적용
+    _apply_device_info(session, {
+        'user_agent': info.dalvik_ua,
+        'device_code': info.device_code,
+        'platform': info.platform,
+    })
+    # 저장
+    storage: EncryptedStorage = context.bot_data[KEY_STORAGE]
+    storage.set_user_device(
+        chat_id,
+        user_agent=info.dalvik_ua,
+        device_code=info.device_code,
+        platform=info.platform,
+    )
+    # 세션 재로그인 강제 (UA 가 바뀌었으니)
+    session.korail.logined = False
+
+    await update.message.reply_text(
+        f"✅ 기기 정보 저장됨\n"
+        f"플랫폼: <b>{info.platform}</b>\n"
+        f"Device: <code>{info.device_code}</code>\n"
+        f"UA: <code>{info.dalvik_ua or '(기본값 유지)'}</code>\n\n"
+        f"다음 코레일 호출부터 적용된다.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 @restricted
@@ -1065,7 +1292,11 @@ def main():
     app.add_handler(CommandHandler('reservations', cmd_reservations))
     app.add_handler(CommandHandler('hunts', cmd_hunts))
     app.add_handler(CommandHandler('hunt_stop', cmd_hunt_stop))
+    app.add_handler(CommandHandler('setdevice', cmd_setdevice))
+    app.add_handler(CommandHandler('cleardevice', cmd_cleardevice))
     app.add_handler(CallbackQueryHandler(cb_hunt_stop, pattern=r"^stop:"))
+    # WebApp 에서 sendData 로 들어오는 메시지
+    app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
     app.add_handler(login_conv)
     app.add_handler(reserve_conv)
 

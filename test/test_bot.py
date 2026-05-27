@@ -10,9 +10,12 @@ from datetime import date
 from unittest.mock import patch
 
 from bot import (
+    DEVICE_ANDROID,
+    DEVICE_IOS,
     authorized_chat_ids,
     format_reservation_success,
     parse_date,
+    parse_device_info,
     parse_time,
 )
 from korail2.korail2 import Reservation
@@ -173,6 +176,91 @@ class AuthorizedChatIdsTests(unittest.TestCase):
         # Telegram 그룹 chat_id 는 음수
         with patch.dict(os.environ, self._clean_env(TELEGRAM_AUTHORIZED_CHAT_IDS='-100123,456'), clear=True):
             self.assertEqual(authorized_chat_ids(), {-100123, 456})
+
+
+class ParseDeviceInfoTests(unittest.TestCase):
+
+    def test_android_modern_webview_ua(self):
+        ua = ('Mozilla/5.0 (Linux; Android 14; SM-S928N Build/UP1A.231005.007; wv) '
+              'AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/120.0.0.0 '
+              'Mobile Safari/537.36')
+        info = parse_device_info(ua, 'android')
+        self.assertEqual(info.platform, 'android')
+        self.assertEqual(info.device_code, DEVICE_ANDROID)
+        self.assertEqual(
+            info.dalvik_ua,
+            'Dalvik/2.1.0 (Linux; U; Android 14; SM-S928N Build/UP1A.231005.007)',
+        )
+
+    def test_android_ua_without_build_uses_default(self):
+        ua = ('Mozilla/5.0 (Linux; Android 14; SM-S928N) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36')
+        info = parse_device_info(ua, 'android')
+        self.assertEqual(info.platform, 'android')
+        self.assertIn('Android 14', info.dalvik_ua)
+        self.assertIn('SM-S928N', info.dalvik_ua)
+        self.assertIn('Build/UP1A.231005.007', info.dalvik_ua)
+
+    def test_android_version_specific_default_build(self):
+        ua = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36'
+        info = parse_device_info(ua, 'android')
+        # Android 13 의 default build 사용
+        self.assertIn('Android 13', info.dalvik_ua)
+        self.assertIn('Pixel 7', info.dalvik_ua)
+        self.assertIn('Build/TP1A.220624.014', info.dalvik_ua)
+
+    def test_android_unknown_version_falls_back(self):
+        ua = 'Mozilla/5.0 (Linux; Android 99; FOO-BAR) AppleWebKit/537.36'
+        info = parse_device_info(ua, 'android')
+        # 모르는 버전이면 default Build (UP1A...) 사용
+        self.assertIn('Android 99', info.dalvik_ua)
+        self.assertIn('FOO-BAR', info.dalvik_ua)
+        self.assertIn('Build/', info.dalvik_ua)
+
+    def test_ios_returns_ios_device_code_no_dalvik(self):
+        ua = ('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
+              'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 '
+              'Mobile/15E148 Safari/604.1')
+        info = parse_device_info(ua, 'ios')
+        self.assertEqual(info.platform, 'ios')
+        self.assertEqual(info.device_code, DEVICE_IOS)
+        self.assertIsNone(info.dalvik_ua)
+
+    def test_ipad_detected_as_ios(self):
+        ua = 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605'
+        info = parse_device_info(ua, 'weba')
+        self.assertEqual(info.platform, 'ios')
+
+    def test_platform_string_drives_android_detection(self):
+        # platform='android_x' (Telegram-X 안드로이드)
+        ua = 'Mozilla/5.0 (Linux; Android 14; SM-S928N) AppleWebKit'
+        info = parse_device_info(ua, 'android_x')
+        self.assertEqual(info.platform, 'android')
+
+    def test_desktop_returns_unknown(self):
+        ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        info = parse_device_info(ua, 'tdesktop')
+        self.assertEqual(info.platform, 'unknown')
+        self.assertIsNone(info.dalvik_ua)
+        self.assertFalse(info.is_usable)
+
+    def test_empty_inputs(self):
+        info = parse_device_info('', '')
+        self.assertEqual(info.platform, 'unknown')
+        self.assertFalse(info.is_usable)
+
+    def test_android_platform_but_malformed_ua(self):
+        # platform 은 안드로이드라고 알려주는데 UA 파싱 실패 → device_code 만 'AD'
+        info = parse_device_info('not a real UA', 'android')
+        self.assertEqual(info.platform, 'android')
+        self.assertEqual(info.device_code, DEVICE_ANDROID)
+        self.assertIsNone(info.dalvik_ua)
+
+    def test_android_ua_with_U_prefix(self):
+        ua = 'Mozilla/5.0 (Linux; U; Android 14; SM-S928N) AppleWebKit'
+        info = parse_device_info(ua, 'android')
+        self.assertEqual(info.platform, 'android')
+        self.assertIn('SM-S928N', info.dalvik_ua)
 
 
 if __name__ == '__main__':

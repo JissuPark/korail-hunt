@@ -32,9 +32,11 @@ class EncryptedStorageTests(unittest.TestCase):
     def test_round_trip_single_user(self):
         s = self._open()
         s.set_user(12345, 'foo@bar.com', 'secret')
-        # 다른 인스턴스로 다시 열어서 같은 데이터가 나오는지
         s2 = self._open()
-        self.assertEqual(s2.get_user(12345), {'korail_id': 'foo@bar.com', 'korail_pw': 'secret'})
+        entry = s2.get_user(12345)
+        self.assertEqual(entry['korail_id'], 'foo@bar.com')
+        self.assertEqual(entry['korail_pw'], 'secret')
+        self.assertIsNone(entry['device_info'])
 
     def test_round_trip_multiple_users(self):
         s = self._open()
@@ -43,7 +45,9 @@ class EncryptedStorageTests(unittest.TestCase):
         s.set_user(333, 'c', 'pw_c')
         s2 = self._open()
         self.assertEqual(set(s2.list_user_ids()), {111, 222, 333})
-        self.assertEqual(s2.get_user(222), {'korail_id': 'b', 'korail_pw': 'pw_b'})
+        entry = s2.get_user(222)
+        self.assertEqual(entry['korail_id'], 'b')
+        self.assertEqual(entry['korail_pw'], 'pw_b')
 
     def test_get_user_returns_none_when_missing(self):
         s = self._open()
@@ -68,13 +72,17 @@ class EncryptedStorageTests(unittest.TestCase):
         s = self._open()
         s.set_user(12345, 'old', 'old_pw')
         s.set_user(12345, 'new', 'new_pw')
-        self.assertEqual(s.get_user(12345), {'korail_id': 'new', 'korail_pw': 'new_pw'})
+        entry = s.get_user(12345)
+        self.assertEqual(entry['korail_id'], 'new')
+        self.assertEqual(entry['korail_pw'], 'new_pw')
 
     def test_korean_credentials_round_trip(self):
         s = self._open()
         s.set_user(12345, '한글ID', '비밀번호123!@#')
         s2 = self._open()
-        self.assertEqual(s2.get_user(12345), {'korail_id': '한글ID', 'korail_pw': '비밀번호123!@#'})
+        entry = s2.get_user(12345)
+        self.assertEqual(entry['korail_id'], '한글ID')
+        self.assertEqual(entry['korail_pw'], '비밀번호123!@#')
 
     def test_get_user_returns_copy_not_reference(self):
         s = self._open()
@@ -124,13 +132,51 @@ class EncryptedStorageTests(unittest.TestCase):
         # 다섯 명 모두 살아있고 마지막 값이 일관돼야 함
         self.assertEqual(set(s.list_user_ids()), {0, 1, 2, 3, 4})
         for i in range(5):
-            self.assertEqual(s.get_user(i), {'korail_id': f'id{i}', 'korail_pw': f'pw{i}'})
+            entry = s.get_user(i)
+            self.assertEqual(entry['korail_id'], f'id{i}')
+            self.assertEqual(entry['korail_pw'], f'pw{i}')
 
     def test_atomic_write_no_tmp_left_behind(self):
         s = self._open()
         s.set_user(12345, 'foo', 'bar')
         tmp = self.path.with_suffix(self.path.suffix + '.tmp')
         self.assertFalse(tmp.exists(), ".tmp 파일이 남아 있으면 atomic write 가 깨진 것")
+
+    # --- device_info ---
+
+    def test_set_user_device_persists(self):
+        s = self._open()
+        s.set_user(12345, 'foo', 'bar')
+        s.set_user_device(12345, user_agent='Dalvik/2.1.0 (test)', device_code='AD', platform='android')
+        s2 = self._open()
+        entry = s2.get_user(12345)
+        self.assertEqual(entry['device_info'], {
+            'user_agent': 'Dalvik/2.1.0 (test)',
+            'device_code': 'AD',
+            'platform': 'android',
+        })
+
+    def test_set_user_device_preserved_across_credential_update(self):
+        s = self._open()
+        s.set_user(12345, 'foo', 'bar')
+        s.set_user_device(12345, user_agent='ua1', device_code='AD', platform='android')
+        # 비번 바꿔도 device_info 살아있어야 함
+        s.set_user(12345, 'foo', 'new_pw')
+        entry = s.get_user(12345)
+        self.assertEqual(entry['korail_pw'], 'new_pw')
+        self.assertEqual(entry['device_info']['user_agent'], 'ua1')
+
+    def test_set_user_device_clear_with_all_none(self):
+        s = self._open()
+        s.set_user(12345, 'foo', 'bar')
+        s.set_user_device(12345, user_agent='ua', device_code='AD', platform='android')
+        s.set_user_device(12345)  # 다 None
+        self.assertIsNone(s.get_user(12345)['device_info'])
+
+    def test_set_user_device_unknown_user_raises(self):
+        s = self._open()
+        with self.assertRaises(KeyError):
+            s.set_user_device(99999, user_agent='x')
 
 
 if __name__ == '__main__':

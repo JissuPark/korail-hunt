@@ -79,11 +79,34 @@ class EncryptedStorage:
     # --- 공개 API: 사용자 자격증명 ---------------------------------------
 
     def set_user(self, chat_id, korail_id, korail_pw):
+        """자격증명만 저장/갱신. device_info 는 보존."""
         with self._lock:
-            self._data.setdefault('users', {})[str(chat_id)] = {
+            users = self._data.setdefault('users', {})
+            existing = users.get(str(chat_id), {})
+            users[str(chat_id)] = {
                 'korail_id': korail_id,
                 'korail_pw': korail_pw,
+                # device_info 는 보존 (재로그인 시 잃지 않게)
+                'device_info': existing.get('device_info'),
             }
+            self._save()
+
+    def set_user_device(self, chat_id, *, user_agent=None, device_code=None, platform=None):
+        """유저의 device 정보만 갱신. 자격증명은 건드리지 않는다.
+        세 값 다 None 이면 device_info 를 지운다."""
+        with self._lock:
+            users = self._data.setdefault('users', {})
+            entry = users.get(str(chat_id))
+            if entry is None:
+                raise KeyError(f"user {chat_id} not found")
+            if user_agent is None and device_code is None and platform is None:
+                entry['device_info'] = None
+            else:
+                entry['device_info'] = {
+                    'user_agent': user_agent,
+                    'device_code': device_code,
+                    'platform': platform,
+                }
             self._save()
 
     def get_user(self, chat_id):
