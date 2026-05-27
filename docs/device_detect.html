@@ -6,9 +6,7 @@
 <title>korail-hunt 기기 정보 감지</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-  :root {
-    color-scheme: light dark;
-  }
+  :root { color-scheme: light dark; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     margin: 0;
@@ -52,13 +50,30 @@
     cursor: pointer;
     margin-top: 12px;
   }
-  button:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
+  button.secondary {
+    background: var(--tg-theme-secondary-bg-color, #f4f4f5);
+    color: var(--tg-theme-text-color, #000000);
   }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
   .warn {
     background: rgba(255, 165, 0, 0.15);
     color: #9a6500;
+    padding: 12px;
+    border-radius: 8px;
+    margin: 12px 0;
+    font-size: 14px;
+  }
+  .err {
+    background: rgba(220, 50, 50, 0.15);
+    color: #b00020;
+    padding: 12px;
+    border-radius: 8px;
+    margin: 12px 0;
+    font-size: 14px;
+  }
+  .ok {
+    background: rgba(40, 180, 60, 0.15);
+    color: #1a7e34;
     padding: 12px;
     border-radius: 8px;
     margin: 12px 0;
@@ -77,30 +92,41 @@
   const tg = window.Telegram && window.Telegram.WebApp;
   const content = document.getElementById('content');
 
-  if (!tg || !tg.initData) {
+  const ua = navigator.userAgent || '(unknown)';
+  const platform = (tg && tg.platform) || '(non-telegram)';
+  const hasInitData = tg && tg.initData && tg.initData.length > 0;
+
+  // Telegram WebApp 객체 자체가 없으면 (브라우저로 직접 열림) 안내만.
+  if (!tg) {
     content.innerHTML =
-      '<div class="warn">이 페이지는 Telegram 봇 안에서만 사용된다. ' +
-      '봇의 /login 후 [기기 정보 감지] 버튼을 통해 열어라.</div>';
+      '<div class="warn">Telegram WebApp 컨텍스트가 아니다.<br>' +
+      '봇 채팅에서 <b>[📱 기기 정보 자동 감지]</b> 버튼을 통해 이 페이지를 열어라.<br>' +
+      '(/setdevice 명령으로 버튼 다시 띄우기 가능)</div>';
     return;
   }
 
   tg.ready();
   tg.expand();
 
-  const ua = navigator.userAgent || '(unknown)';
-  const platform = tg.platform || '(unknown)';
+  const warnBlock = hasInitData
+    ? ''
+    : '<div class="warn">⚠️ initData 가 비어 있음 — Telegram 컨텍스트가 약하지만 ' +
+      '아래 정보로 전송은 시도해볼 수 있다. 실패하면 봇 채팅으로 돌아가 ' +
+      '/setdevice 부터 다시 열어라.</div>';
 
-  content.innerHTML = `
-    <div class="info">
-      <div class="label">Telegram 플랫폼</div>
-      <div class="value">${platform}</div>
-    </div>
-    <div class="info">
-      <div class="label">User-Agent</div>
-      <div class="value">${ua}</div>
-    </div>
-    <button id="send">이 정보로 저장</button>
-  `;
+  content.innerHTML =
+    warnBlock +
+    '<div class="info">' +
+      '<div class="label">Telegram 플랫폼</div>' +
+      '<div class="value">' + escapeHtml(platform) + '</div>' +
+    '</div>' +
+    '<div class="info">' +
+      '<div class="label">User-Agent</div>' +
+      '<div class="value" id="ua-display">' + escapeHtml(ua) + '</div>' +
+    '</div>' +
+    '<button id="send">이 정보로 저장</button>' +
+    '<button id="copy" class="secondary" style="margin-top: 8px;">UA 복사 (수동 fallback)</button>' +
+    '<div id="result"></div>';
 
   document.getElementById('send').addEventListener('click', function () {
     const payload = JSON.stringify({
@@ -108,14 +134,43 @@
       user_agent: ua,
       platform: platform,
     });
+    const result = document.getElementById('result');
     try {
       tg.sendData(payload);
-      // sendData 는 자동으로 webview 를 닫는다. fallback 으로도 호출.
-      tg.close();
+      result.innerHTML = '<div class="ok">✓ 전송됨. 봇 채팅으로 돌아가라.</div>';
+      // sendData 호출 직후 webview 가 자동 닫혀야 정상.
+      // 안 닫히는 경우를 대비해 1초 뒤 명시적 close.
+      setTimeout(function () {
+        try { tg.close(); } catch (e) {}
+      }, 1000);
     } catch (e) {
-      alert('전송 실패: ' + e.message);
+      result.innerHTML =
+        '<div class="err">전송 실패: ' + escapeHtml(e.message || String(e)) + '<br>' +
+        '아래 [UA 복사] 로 복사한 뒤 봇한테 텍스트로 보내봐라.</div>';
     }
   });
+
+  document.getElementById('copy').addEventListener('click', function () {
+    const text = JSON.stringify({ user_agent: ua, platform: platform });
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        document.getElementById('result').innerHTML =
+          '<div class="ok">✓ 클립보드에 복사됨. 봇 채팅으로 가서 그대로 붙여넣어라.</div>';
+      }).catch(function (e) {
+        document.getElementById('result').innerHTML =
+          '<div class="err">복사 실패: ' + escapeHtml(e.message) + '</div>';
+      });
+    } else {
+      document.getElementById('result').innerHTML =
+        '<div class="warn">클립보드 API 미지원. UA 박스를 길게 눌러 직접 복사하라.</div>';
+    }
+  });
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+    });
+  }
 })();
 </script>
 </body>
