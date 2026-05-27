@@ -26,6 +26,10 @@ bot_storage.enc
 bot_storage.enc.tmp
 *.enc
 
+# 봇 백그라운드 실행 산출물
+bot.log
+.bot.pid
+
 # venv
 venv/
 .venv/

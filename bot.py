@@ -1229,13 +1229,24 @@ def _init_storage():
         raise SystemExit(str(e))
 
 
-def main():
+def _setup_logging():
+    """콘솔 + (BOT_LOG_FILE 설정 시) 파일 로깅. pythonw 백그라운드 실행 시
+    stderr 가 사라져도 파일로는 남게 한다."""
+    handlers = [logging.StreamHandler()]
+    log_file = os.environ.get('BOT_LOG_FILE')
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, mode='a', encoding='utf-8'))
     logging.basicConfig(
         format='%(asctime)s %(levelname)s %(name)s: %(message)s',
         level=logging.INFO,
+        handlers=handlers,
     )
     logging.getLogger('httpx').setLevel(logging.WARNING)
     logging.getLogger('telegram').setLevel(logging.WARNING)
+
+
+def main():
+    _setup_logging()
 
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     if not token:
