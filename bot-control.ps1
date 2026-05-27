@@ -93,7 +93,32 @@ function Start-Bot {
   $proc = Start-Process @startArgs
 
   $proc.Id | Out-File -FilePath $PidFile -Encoding ascii
-  Write-Host "✓ 봇 시작 (PID $($proc.Id))" -ForegroundColor Green
+  Write-Host "프로세스 시작됨 (PID $($proc.Id)). 살아있는지 확인 중..." -ForegroundColor Cyan
+
+  # 시작 직후 죽는 경우(SystemExit, import 에러 등) 감지: 2초 대기 후 alive 체크
+  Start-Sleep -Seconds 2
+  $check = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
+  if (-not $check) {
+    Remove-Item $PidFile -ErrorAction SilentlyContinue
+    Write-Host "✗ 봇이 시작 직후 종료됨" -ForegroundColor Red
+    if (Test-Path $LogFile) {
+      Write-Host ""
+      Write-Host "[$LogFile] 마지막 20줄:" -ForegroundColor Yellow
+      $prev = [Console]::OutputEncoding
+      [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+      try {
+        Get-Content $LogFile -Tail 20 -Encoding UTF8
+      } finally {
+        [Console]::OutputEncoding = $prev
+      }
+    } else {
+      Write-Host "로그 파일이 만들어지지도 않았다 → bot.py 가 import 단계에서 죽었을 가능성." -ForegroundColor Yellow
+      Write-Host "venv 활성화 후 'python bot.py' 직접 실행해서 콘솔에 뜨는 에러를 확인하라."
+    }
+    return
+  }
+
+  Write-Host "✓ 봇 정상 실행 중 (PID $($proc.Id))" -ForegroundColor Green
   Write-Host "  실행: $Exe bot.py"
   Write-Host "  로그: $LogFile"
   Write-Host "  관리: .\bot-control.ps1 {start|stop|restart|status|logs}"

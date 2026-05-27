@@ -1247,7 +1247,21 @@ def _setup_logging():
 
 def main():
     _setup_logging()
+    try:
+        _main_body()
+    except SystemExit as e:
+        # pythonw 백그라운드 실행 시 stderr 가 버려져서 SystemExit 메시지가
+        # 사라진다. 로거를 거치게 해 bot.log 에 반드시 남게 한다.
+        code = e.code if isinstance(e.code, str) else str(e.code or '')
+        if code and code != '0':
+            logger.error("봇 종료: %s", code)
+        raise
+    except Exception:
+        logger.exception("봇 비정상 종료")
+        raise
 
+
+def _main_body():
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN 환경변수가 필요하다 (.env 확인)")
