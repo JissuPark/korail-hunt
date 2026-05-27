@@ -449,21 +449,30 @@ async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def login_ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     korail_id = update.message.text.strip()
+    if not korail_id or korail_id.startswith('/'):
+        await update.message.reply_text(
+            "올바른 ID 가 아니다. 회원번호(8자리) / 이메일 / 010-XXXX-XXXX 중 하나를 입력하라.\n"
+            "취소: /cancel"
+        )
+        return LOGIN_ASK_ID
     context.user_data[KEY_LOGIN_ID] = korail_id
-    # ID 메시지는 식별 정보라 best-effort 삭제
-    try:
-        await update.message.delete()
-    except Exception:
-        pass
-    await update.effective_message.reply_text(
-        "비밀번호 입력 (다음 메시지는 즉시 삭제됨).\n"
-        "취소: /cancel"
+    # ID 는 비밀이 아니라 굳이 삭제하지 않는다. 삭제하면 대화 흐름이
+    # 봇 혼자 진행하는 것처럼 보여 사용자가 혼란스러워한다.
+    await update.message.reply_text(
+        f"ID 받음: <code>{korail_id}</code>\n\n"
+        f"비밀번호 입력 (보안상 다음 메시지는 즉시 삭제됨).\n"
+        f"취소: /cancel",
+        parse_mode=ParseMode.HTML,
     )
     return LOGIN_ASK_PW
 
 
 async def login_ask_pw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     korail_pw = update.message.text
+    if korail_pw.startswith('/'):
+        # 명령어를 비번으로 받지 않도록 방어
+        await update.message.reply_text("비밀번호 입력 단계. /cancel 로 취소, 아니면 비밀번호 입력.")
+        return LOGIN_ASK_PW
     # 비번 메시지 즉시 삭제 (best-effort; private chat 에서는 가능)
     try:
         await update.message.delete()
@@ -1280,7 +1289,8 @@ def _main_body():
     app.bot_data[KEY_SESSIONS] = {}
     app.bot_data[KEY_HUNT_TASKS] = {}
 
-    # /login conv. 텍스트 입력 위주.
+    # /login conv. 텍스트 입력 위주. allow_reentry 로 사용자가 도중에 /login
+    # 다시 쳐도 깔끔하게 재시작.
     login_conv = ConversationHandler(
         entry_points=[CommandHandler('login', login_start)],
         states={
@@ -1288,9 +1298,10 @@ def _main_body():
             LOGIN_ASK_PW: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_ask_pw)],
         },
         fallbacks=[CommandHandler('cancel', login_cancel)],
+        allow_reentry=True,
     )
 
-    # /reserve conv. 콜백 위주.
+    # /reserve conv. 콜백 위주. allow_reentry 로 /reserve 다시 치면 재시작.
     reserve_conv = ConversationHandler(
         entry_points=[CommandHandler('reserve', conv_start)],
         states={
@@ -1308,6 +1319,7 @@ def _main_body():
             SELECT_OPTION: [CallbackQueryHandler(conv_option, pattern=r"^(opt:|cancel$)")],
         },
         fallbacks=[CommandHandler('cancel', conv_cancel)],
+        allow_reentry=True,
     )
 
     app.add_handler(CommandHandler('start', cmd_start))
