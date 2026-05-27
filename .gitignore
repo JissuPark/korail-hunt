@@ -21,6 +21,14 @@ test/korail_idpw.txt
 
 # 자격증명 (절대 커밋 금지)
 .env
+# 봇 멀티유저 암호화 저장소 (자격증명 들어 있음)
+bot_storage.enc
+bot_storage.enc.tmp
+*.enc
+
+# venv
+venv/
+.venv/
 
 # Claude Code 로컬 상태
 .claude/

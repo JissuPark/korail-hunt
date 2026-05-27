@@ -1,22 +1,29 @@
 """
-korail-hunt Telegram 봇.
+korail-hunt Telegram 봇 (멀티 유저).
+
+각 Telegram 사용자가 본인 코레일 자격증명으로 로그인하고, 본인의 헌팅
+리스트를 독립적으로 관리한다.
 
 흐름:
-  /reserve  → 출발일 → 출발시각 → 출발역 → 도착역 → 열차 선택 → 좌석옵션 → 예약
-  좌석이 없으면 [헌팅 시작] 버튼이 노출되고, polling 으로 자동 예약을 시도한다.
-  /hunt_stop      → 진행 중인 헌팅 중단
-  /reservations   → 현재 예약 목록
+  /login          → 코레일 ID/PW 입력 (저장됨, 봇 재시작 해도 유지)
+  /reserve        → 출발일 → 출발시각 → 출발역 → 도착역 → 열차 선택 → 좌석옵션 → 예약
+  /reservations   → 본인 예약 목록
+  /hunts          → 진행 중인 본인 헌팅
+  /hunt_stop      → 본인 헌팅 중단
+  /logout         → 자격증명 삭제 + 모든 헌팅 중단
+  /whoami         → 현재 로그인 정보
   /cancel         → 대화 취소
   /help           → 도움말
 
 실행:
   pip install -e ".[bot]"
-  .env 에 TELEGRAM_BOT_TOKEN, TELEGRAM_AUTHORIZED_CHAT_ID, KORAIL_ID, KORAIL_PW 설정
+  .env 설정 (TELEGRAM_BOT_TOKEN, TELEGRAM_AUTHORIZED_CHAT_IDS, BOT_STORAGE_KEY)
   python bot.py
 """
 import asyncio
 import logging
 import os
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from functools import wraps
 
@@ -47,18 +54,20 @@ from telegram.ext import (
 )
 
 from korail2 import (
-    Korail,
     KorailError,
     NoResultsError,
     PatchedKorail,
     ReserveOption,
     SoldOutError,
 )
+from korail2.storage import EncryptedStorage, StorageKeyError, generate_key
 
 logger = logging.getLogger(__name__)
 
-# ConversationHandler states
+# ConversationHandler states — /reserve
 ASK_DATE, ASK_TIME, ASK_DEP, ASK_ARR, SELECT_TRAIN, SELECT_OPTION = range(6)
+# ConversationHandler states — /login (다른 conv 와 안 겹치게 100번대)
+LOGIN_ASK_ID, LOGIN_ASK_PW = range(100, 102)
 
 # context.user_data 키
 KEY_DATE = 'date'
@@ -67,15 +76,55 @@ KEY_DEP = 'dep'
 KEY_ARR = 'arr'
 KEY_TRAINS = 'trains'
 KEY_SELECTED_TRAIN_IDX = 'sel'
+KEY_LOGIN_ID = 'login_id'
 
 # context.bot_data 키
-KEY_KORAIL = 'korail'
-KEY_KORAIL_LOCK = 'korail_lock'  # 모든 코레일 호출 직렬화용 asyncio.Lock
-KEY_HUNT_TASKS = 'hunt_tasks'  # chat_id -> asyncio.Task
+KEY_SESSIONS = 'sessions'          # chat_id -> UserSession
+KEY_STORAGE = 'storage'            # EncryptedStorage
+KEY_HUNT_TASKS = 'hunt_tasks'      # chat_id -> {hunt_id -> {task,label}}
 
 
 # ---------------------------------------------------------------------------
-# 파서
+# 유저 세션
+# ---------------------------------------------------------------------------
+
+@dataclass
+class UserSession:
+    """한 Telegram 사용자에 대한 코레일 세션. lock 은 본 인스턴스 호출 직렬화."""
+    chat_id: int
+    korail: PatchedKorail
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+def _get_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """현재 메모리에 있는 세션 반환. 없으면 storage 에서 만들어 캐싱."""
+    sessions = context.bot_data.setdefault(KEY_SESSIONS, {})
+    if chat_id in sessions:
+        return sessions[chat_id]
+    storage: EncryptedStorage = context.bot_data[KEY_STORAGE]
+    creds = storage.get_user(chat_id)
+    if creds is None:
+        return None
+    korail = PatchedKorail(creds['korail_id'], creds['korail_pw'], auto_login=False)
+    session = UserSession(chat_id=chat_id, korail=korail)
+    sessions[chat_id] = session
+    return session
+
+
+async def _korail_call(session: UserSession, fn, *args, **kwargs):
+    """세션 단위 lock 으로 직렬화. requests.Session 동시 접근 방지."""
+    async with session.lock:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+async def _ensure_login(session: UserSession):
+    async with session.lock:
+        if not session.korail.logined:
+            await asyncio.to_thread(session.korail.login)
+
+
+# ---------------------------------------------------------------------------
+# 파서 / 포매터 (변경 없음)
 # ---------------------------------------------------------------------------
 
 def parse_date(text, today=None):
@@ -123,35 +172,39 @@ def format_reservation_success(rsv):
 
 
 # ---------------------------------------------------------------------------
-# 인증
+# 인증 (chat_id 화이트리스트)
 # ---------------------------------------------------------------------------
 
-def authorized_chat_id():
-    v = os.environ.get('TELEGRAM_AUTHORIZED_CHAT_ID')
-    if not v:
-        return None
-    try:
-        return int(v)
-    except ValueError:
-        logger.warning("TELEGRAM_AUTHORIZED_CHAT_ID 가 정수가 아니다: %r", v)
-        return None
+def authorized_chat_ids():
+    """허용된 chat_id 집합 반환. 비어 있으면 빈 set (= 아무도 허용 안 함)."""
+    raw = os.environ.get('TELEGRAM_AUTHORIZED_CHAT_IDS') or os.environ.get('TELEGRAM_AUTHORIZED_CHAT_ID') or ''
+    out = set()
+    for part in raw.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            logger.warning("TELEGRAM_AUTHORIZED_CHAT_IDS 에 정수가 아닌 값: %r", part)
+    return out
 
 
 def restricted(func):
-    """인증된 chat_id 에서 온 업데이트만 처리한다."""
+    """허용된 chat_id 에서 온 업데이트만 처리한다."""
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        allowed = authorized_chat_id()
+        allowed = authorized_chat_ids()
         chat_id = update.effective_chat.id if update.effective_chat else None
-        if allowed is None:
-            # 미설정 시 첫 사용자에게 본인 chat_id 를 알려준다 (셋업 도움)
+        if not allowed:
+            # 미설정 시 본인 chat_id 안내
             await update.effective_message.reply_text(
-                "TELEGRAM_AUTHORIZED_CHAT_ID 가 설정되어 있지 않다.\n"
-                f"이 chat_id 를 .env 에 적은 뒤 봇을 재시작하라: <code>{chat_id}</code>",
+                "TELEGRAM_AUTHORIZED_CHAT_IDS 가 설정되어 있지 않다.\n"
+                f"본인 chat_id 를 .env 에 추가한 뒤 봇 재시작: <code>{chat_id}</code>",
                 parse_mode=ParseMode.HTML,
             )
             return ConversationHandler.END
-        if chat_id != allowed:
+        if chat_id not in allowed:
             logger.warning("인증 실패: %s (허용: %s)", chat_id, allowed)
             await update.effective_message.reply_text("권한 없음")
             return ConversationHandler.END
@@ -159,25 +212,19 @@ def restricted(func):
     return wrapper
 
 
-# ---------------------------------------------------------------------------
-# 공용
-# ---------------------------------------------------------------------------
-
-async def _korail_call(context: ContextTypes.DEFAULT_TYPE, fn, *args, **kwargs):
-    """모든 코레일 호출은 이 헬퍼를 통해 직렬화. requests.Session 이
-    thread-safe 하지 않아 동시 헌팅 N개가 cookie jar 등을 손상시키는 걸
-    막는다."""
-    async with context.bot_data[KEY_KORAIL_LOCK]:
-        return await asyncio.to_thread(fn, *args, **kwargs)
-
-
-async def _ensure_login(context: ContextTypes.DEFAULT_TYPE):
-    """logined 플래그가 꺼져 있으면 재로그인. 검사+로그인을 같은 lock 안에서
-    수행해서 동시에 두 코루틴이 둘 다 login() 을 호출하는 경쟁을 막는다."""
-    korail = context.bot_data[KEY_KORAIL]
-    async with context.bot_data[KEY_KORAIL_LOCK]:
-        if not korail.logined:
-            await asyncio.to_thread(korail.login)
+def needs_login(func):
+    """세션 없으면 /login 안내. 핸들러는 session 인자를 추가로 받는다."""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        chat_id = update.effective_chat.id
+        session = _get_session(context, chat_id)
+        if session is None:
+            await update.effective_message.reply_text(
+                "먼저 /login 으로 코레일 자격증명을 등록하라."
+            )
+            return ConversationHandler.END
+        return await func(update, context, session, *args, **kwargs)
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -185,31 +232,70 @@ async def _ensure_login(context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 HELP_TEXT = (
-    "korail-hunt 봇\n"
-    "/reserve - 예약 시작 (일시 → 역 → 열차 → 옵션)\n"
+    "korail-hunt 봇 (멀티 유저)\n"
+    "\n"
+    "<b>자격증명</b>\n"
+    "/login - 코레일 ID/PW 등록\n"
+    "/logout - 자격증명 삭제 + 모든 헌팅 중단\n"
+    "/whoami - 현재 로그인 정보\n"
+    "\n"
+    "<b>예약</b>\n"
+    "/reserve - 예약 시작\n"
     "/reservations - 현재 예약\n"
+    "\n"
+    "<b>헌팅</b>\n"
+    "/hunts - 진행 중인 헌팅\n"
     "/hunt_stop - 헌팅 중단\n"
-    "/cancel - 진행 취소\n"
+    "\n"
+    "/cancel - 진행 중인 대화 취소\n"
     "/help - 도움말"
 )
 
 
 @restricted
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
 
 
 @restricted
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
 
 
 @restricted
-async def cmd_reservations(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    korail: Korail = context.bot_data[KEY_KORAIL]
-    await _ensure_login(context)
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    session = _get_session(context, chat_id)
+    if session is None:
+        await update.message.reply_text(
+            f"chat_id: <code>{chat_id}</code>\n로그인 안 됨. /login 으로 등록.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    k = session.korail
+    if not k.logined:
+        await update.message.reply_text(
+            f"chat_id: <code>{chat_id}</code>\n"
+            f"코레일 ID: <code>{k.korail_id}</code>\n"
+            f"로그인 상태: 미로그인 (다음 호출에서 자동 로그인)",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    await update.message.reply_text(
+        f"chat_id: <code>{chat_id}</code>\n"
+        f"코레일 ID: <code>{k.korail_id}</code>\n"
+        f"이름: {k.name}\n"
+        f"회원번호: {k.membership_number}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@restricted
+@needs_login
+async def cmd_reservations(update: Update, context: ContextTypes.DEFAULT_TYPE, session: UserSession):
+    await _ensure_login(session)
     try:
-        rsvs = await _korail_call(context, korail.reservations)
+        rsvs = await _korail_call(session, session.korail.reservations)
     except KorailError as e:
         await update.message.reply_text(f"조회 실패: {e}")
         return
@@ -221,6 +307,127 @@ async def cmd_reservations(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @restricted
+async def cmd_hunts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    active = _active_hunts(context, chat_id)
+    if not active:
+        await update.message.reply_text("진행 중인 헌팅 없음")
+        return
+    lines = [f"진행 중인 헌팅 ({len(active)}개):"]
+    for hid, entry in active.items():
+        lines.append(f"  [{hid}] {entry['label']}")
+    lines.append("\n/hunt_stop 으로 중단")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# /login ConversationHandler
+# ---------------------------------------------------------------------------
+
+@restricted
+async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    existing = _get_session(context, chat_id)
+    if existing:
+        await update.message.reply_text(
+            f"이미 로그인 됨: {existing.korail.korail_id}\n"
+            "다른 계정으로 바꾸려면 /logout 후 다시 /login.",
+        )
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "코레일 ID 입력 (회원번호 8자리 / 이메일 / 010-XXXX-XXXX).\n"
+        "취소: /cancel"
+    )
+    return LOGIN_ASK_ID
+
+
+async def login_ask_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    korail_id = update.message.text.strip()
+    context.user_data[KEY_LOGIN_ID] = korail_id
+    # ID 메시지는 식별 정보라 best-effort 삭제
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    await update.effective_message.reply_text(
+        "비밀번호 입력 (다음 메시지는 즉시 삭제됨).\n"
+        "취소: /cancel"
+    )
+    return LOGIN_ASK_PW
+
+
+async def login_ask_pw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    korail_pw = update.message.text
+    # 비번 메시지 즉시 삭제 (best-effort; private chat 에서는 가능)
+    try:
+        await update.message.delete()
+    except Exception:
+        logger.warning("비번 메시지 삭제 실패 — 사용자가 수동으로 지워야 함")
+
+    korail_id = context.user_data.pop(KEY_LOGIN_ID, None)
+    if not korail_id:
+        await update.effective_message.reply_text("세션 만료. /login 다시 시도.")
+        return ConversationHandler.END
+
+    await update.effective_message.reply_text("코레일 로그인 시도 중...")
+
+    korail = PatchedKorail(korail_id, korail_pw, auto_login=False)
+    try:
+        ok = await asyncio.to_thread(korail.login)
+    except Exception as e:
+        logger.exception("로그인 중 예외")
+        await update.effective_message.reply_text(f"❌ 로그인 중 오류: {e}")
+        return ConversationHandler.END
+
+    if not ok:
+        await update.effective_message.reply_text(
+            "❌ 로그인 실패. 자격증명 또는 클라이언트 버전(.env 의 KORAIL_LOGIN_VERSION) 확인."
+        )
+        return ConversationHandler.END
+
+    # 저장 + 세션 캐시
+    storage: EncryptedStorage = context.bot_data[KEY_STORAGE]
+    storage.set_user(update.effective_chat.id, korail_id, korail_pw)
+    session = UserSession(chat_id=update.effective_chat.id, korail=korail)
+    context.bot_data.setdefault(KEY_SESSIONS, {})[update.effective_chat.id] = session
+
+    await update.effective_message.reply_text(
+        f"✅ 로그인 성공: {korail.name} ({korail.membership_number})\n"
+        f"자격증명이 암호화되어 저장됐다. /reserve 로 시작.",
+    )
+    return ConversationHandler.END
+
+
+@restricted
+async def login_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop(KEY_LOGIN_ID, None)
+    await update.message.reply_text("로그인 취소")
+    return ConversationHandler.END
+
+
+@restricted
+async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    # 헌팅 모두 중단
+    active = _active_hunts(context, chat_id)
+    for entry in active.values():
+        entry['task'].cancel()
+    # 메모리 세션 제거
+    context.bot_data.get(KEY_SESSIONS, {}).pop(chat_id, None)
+    # 저장소에서 자격증명 제거
+    storage: EncryptedStorage = context.bot_data[KEY_STORAGE]
+    removed = storage.delete_user(chat_id)
+    msg = "로그아웃 완료. 자격증명 삭제." if removed else "로그아웃 (저장된 자격증명 없음)."
+    if active:
+        msg += f"\n진행 중이던 헌팅 {len(active)}개 중단 요청."
+    await update.message.reply_text(msg)
+
+
+# ---------------------------------------------------------------------------
+# /hunt_stop
+# ---------------------------------------------------------------------------
+
+@restricted
 async def cmd_hunt_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     active = _active_hunts(context, chat_id)
@@ -228,7 +435,6 @@ async def cmd_hunt_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("진행 중인 헌팅 없음")
         return
 
-    # 1개면 바로 중단. 중단 메시지는 헌팅 루프의 CancelledError 핸들러가 보낸다.
     if len(active) == 1:
         next(iter(active.values()))['task'].cancel()
         return
@@ -245,7 +451,6 @@ async def cmd_hunt_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cb_hunt_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/hunt_stop UI 의 'stop:*' 콜백. ConversationHandler 외부에 등록된다."""
     query = update.callback_query
     await query.answer()
     chat_id = update.effective_chat.id
@@ -275,7 +480,7 @@ async def cb_hunt_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Conversation: /reserve 흐름
+# /reserve ConversationHandler
 # ---------------------------------------------------------------------------
 
 WEEKDAY_KO = ['월', '화', '수', '목', '금', '토', '일']
@@ -335,6 +540,10 @@ def _time_keyboard():
 
 @restricted
 async def conv_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if _get_session(context, chat_id) is None:
+        await update.message.reply_text("먼저 /login 하라.")
+        return ConversationHandler.END
     context.user_data.clear()
     await update.message.reply_text("출발일 선택:", reply_markup=_date_keyboard())
     return ASK_DATE
@@ -426,17 +635,20 @@ async def conv_arr_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _show_trains(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """열차 검색 결과를 출력하고 선택 키보드를 제시한다."""
-    korail: Korail = context.bot_data[KEY_KORAIL]
+    session = _get_session(context, update.effective_chat.id)
+    if session is None:
+        await update.effective_message.reply_text("로그인 만료. /login 다시 하라.")
+        return ConversationHandler.END
+
     dep = context.user_data[KEY_DEP]
     arr = context.user_data[KEY_ARR]
     d = context.user_data[KEY_DATE]
     t = context.user_data[KEY_TIME]
 
-    await _ensure_login(context)
+    await _ensure_login(session)
     try:
         trains = await _korail_call(
-            context, korail.search_train, dep, arr, d, t, include_no_seats=True,
+            session, session.korail.search_train, dep, arr, d, t, include_no_seats=True,
         )
     except NoResultsError:
         trains = []
@@ -521,23 +733,25 @@ async def conv_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query.data.startswith("opt:"):
         return SELECT_OPTION
 
+    session = _get_session(context, update.effective_chat.id)
+    if session is None:
+        await query.edit_message_text("로그인 만료. /login 다시 하라.")
+        return ConversationHandler.END
+
     option = getattr(ReserveOption, query.data.split(":", 1)[1])
-    korail: Korail = context.bot_data[KEY_KORAIL]
     train_idx = context.user_data[KEY_SELECTED_TRAIN_IDX]
     train = context.user_data[KEY_TRAINS][train_idx]
 
-    # 매진 열차면 예약 시도 건너뛰고 즉시 해당 열차 헌팅 시작.
     if not train.has_seat():
         await query.edit_message_text(f"{train!r}\n좌석 없음 — 이 열차 헌팅 시작")
         await _start_train_hunt(update, context, train_idx, option)
         return ConversationHandler.END
 
     await query.edit_message_text(f"예약 중... {train!r}")
-    await _ensure_login(context)
+    await _ensure_login(session)
     try:
-        rsv = await _korail_call(context, korail.reserve, train, None, option, False)
+        rsv = await _korail_call(session, session.korail.reserve, train, None, option, False)
     except SoldOutError:
-        # 검색 후 예약 직전에 매진 — 같은 열차로 헌팅 fallback.
         await update.effective_message.reply_text(
             f"{train!r}\n예약 직전 매진 — 이 열차 헌팅 시작"
         )
@@ -570,8 +784,6 @@ async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # 헌팅 백그라운드
 # ---------------------------------------------------------------------------
-# bot_data[KEY_HUNT_TASKS] = {chat_id: {hunt_id: {'task': Task, 'label': str}}}
-# hunt_id 는 chat 단위로 'h1', 'h2', ... 자동 발급. 한 chat 에서 동시 다수 헌팅 가능.
 
 def _chat_hunts(context, chat_id):
     return context.bot_data.setdefault(KEY_HUNT_TASKS, {}).setdefault(chat_id, {})
@@ -599,6 +811,10 @@ def _active_hunts(context, chat_id):
 
 async def _start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    session = _get_session(context, chat_id)
+    if session is None:
+        await update.effective_message.reply_text("로그인 만료. /login 다시.")
+        return
     chat_hunts = _chat_hunts(context, chat_id)
 
     dep = context.user_data[KEY_DEP]
@@ -615,29 +831,28 @@ async def _start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     task = asyncio.create_task(
-        _hunt_loop(context, chat_id, hunt_id, label, dep, arr, d, t, interval)
+        _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t, interval)
     )
     chat_hunts[hunt_id] = {'task': task, 'label': label}
 
 
-async def _hunt_loop(context, chat_id, hunt_id, label, dep, arr, d, t, interval):
-    korail: Korail = context.bot_data[KEY_KORAIL]
+async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t, interval):
     bot = context.bot
     attempts = 0
     try:
         while True:
             attempts += 1
             try:
-                await _ensure_login(context)
+                await _ensure_login(session)
                 trains = await _korail_call(
-                    context, korail.search_train_allday, dep, arr, d, t,
+                    session, session.korail.search_train_allday, dep, arr, d, t,
                 )
             except NoResultsError:
                 await asyncio.sleep(interval)
                 continue
             except KorailError as e:
                 logger.warning("hunt[%s] search: %s", hunt_id, e)
-                korail.logined = False
+                session.korail.logined = False
                 await asyncio.sleep(interval)
                 continue
             except Exception:
@@ -647,7 +862,7 @@ async def _hunt_loop(context, chat_id, hunt_id, label, dep, arr, d, t, interval)
 
             try:
                 rsv = await _korail_call(
-                    context, korail.reserve, trains[0], None, ReserveOption.GENERAL_FIRST, False,
+                    session, session.korail.reserve, trains[0], None, ReserveOption.GENERAL_FIRST, False,
                 )
             except SoldOutError:
                 await asyncio.sleep(interval)
@@ -677,8 +892,11 @@ async def _hunt_loop(context, chat_id, hunt_id, label, dep, arr, d, t, interval)
 
 
 async def _start_train_hunt(update, context, train_idx, option):
-    """특정 열차 한 대만 노린 헌팅. 검색 후 매진 떴을 때 진입."""
     chat_id = update.effective_chat.id
+    session = _get_session(context, chat_id)
+    if session is None:
+        await update.effective_message.reply_text("로그인 만료. /login 다시.")
+        return
     chat_hunts = _chat_hunts(context, chat_id)
 
     train = context.user_data[KEY_TRAINS][train_idx]
@@ -697,29 +915,28 @@ async def _start_train_hunt(update, context, train_idx, option):
     )
 
     task = asyncio.create_task(
-        _train_hunt_loop(context, chat_id, hunt_id, label, target, dep, arr, d, t, option, interval)
+        _train_hunt_loop(context, session, chat_id, hunt_id, label, target, dep, arr, d, t, option, interval)
     )
     chat_hunts[hunt_id] = {'task': task, 'label': label}
 
 
-async def _train_hunt_loop(context, chat_id, hunt_id, label, target, dep, arr, d, t, option, interval):
-    korail: Korail = context.bot_data[KEY_KORAIL]
+async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target, dep, arr, d, t, option, interval):
     bot = context.bot
     attempts = 0
     try:
         while True:
             attempts += 1
             try:
-                await _ensure_login(context)
+                await _ensure_login(session)
                 trains = await _korail_call(
-                    context, korail.search_train, dep, arr, d, t, include_no_seats=True,
+                    session, session.korail.search_train, dep, arr, d, t, include_no_seats=True,
                 )
             except NoResultsError:
                 await asyncio.sleep(interval)
                 continue
             except KorailError as e:
                 logger.warning("train hunt[%s] search: %s", hunt_id, e)
-                korail.logined = False
+                session.korail.logined = False
                 await asyncio.sleep(interval)
                 continue
             except Exception:
@@ -737,7 +954,7 @@ async def _train_hunt_loop(context, chat_id, hunt_id, label, target, dep, arr, d
                 continue
 
             try:
-                rsv = await _korail_call(context, korail.reserve, match, None, option, False)
+                rsv = await _korail_call(session, session.korail.reserve, match, None, option, False)
             except SoldOutError:
                 await asyncio.sleep(interval)
                 continue
@@ -769,12 +986,27 @@ async def _train_hunt_loop(context, chat_id, hunt_id, label, target, dep, arr, d
 # main
 # ---------------------------------------------------------------------------
 
+def _init_storage():
+    key = os.environ.get('BOT_STORAGE_KEY')
+    if not key:
+        suggested = generate_key()
+        raise SystemExit(
+            f"BOT_STORAGE_KEY 환경변수가 필요하다. .env 에 다음 줄 추가:\n"
+            f"BOT_STORAGE_KEY={suggested}\n"
+            f"이 키가 바뀌면 저장된 자격증명을 복호화할 수 없으니 분실 주의."
+        )
+    path = os.environ.get('BOT_STORAGE_PATH', 'bot_storage.enc')
+    try:
+        return EncryptedStorage(path, key)
+    except StorageKeyError as e:
+        raise SystemExit(str(e))
+
+
 def main():
     logging.basicConfig(
         format='%(asctime)s %(levelname)s %(name)s: %(message)s',
         level=logging.INFO,
     )
-    # PTB 가 자체 로깅이 많아 INFO 이상으로 낮춤
     logging.getLogger('httpx').setLevel(logging.WARNING)
     logging.getLogger('telegram').setLevel(logging.WARNING)
 
@@ -782,23 +1014,32 @@ def main():
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN 환경변수가 필요하다 (.env 확인)")
 
-    korail_id = os.environ.get('KORAIL_ID')
-    korail_pw = os.environ.get('KORAIL_PW')
-    if not (korail_id and korail_pw):
-        raise SystemExit("KORAIL_ID/KORAIL_PW 환경변수가 필요하다 (.env 확인)")
+    allowed = authorized_chat_ids()
+    if not allowed:
+        logger.warning(
+            "TELEGRAM_AUTHORIZED_CHAT_IDS 가 비어 있다 — 아무도 봇을 쓸 수 없다. "
+            "첫 사용자가 메시지를 보내면 본인 chat_id 가 안내된다."
+        )
 
-    korail = PatchedKorail(korail_id, korail_pw, auto_login=False)
-    if not korail.login():
-        raise SystemExit("코레일 로그인 실패 — 자격증명을 확인하라")
+    storage = _init_storage()
 
     app = Application.builder().token(token).build()
-    app.bot_data[KEY_KORAIL] = korail
-    app.bot_data[KEY_KORAIL_LOCK] = asyncio.Lock()
+    app.bot_data[KEY_STORAGE] = storage
+    app.bot_data[KEY_SESSIONS] = {}
     app.bot_data[KEY_HUNT_TASKS] = {}
 
-    # 콜백 패턴을 명시해서 ConversationHandler 가 자기 화면의 콜백만 잡도록.
-    # 그래야 '/hunt_stop' 의 stop:* 콜백이 대화 도중에도 안전히 외부 핸들러로 흐른다.
-    conv = ConversationHandler(
+    # /login conv. 텍스트 입력 위주.
+    login_conv = ConversationHandler(
+        entry_points=[CommandHandler('login', login_start)],
+        states={
+            LOGIN_ASK_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_ask_id)],
+            LOGIN_ASK_PW: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_ask_pw)],
+        },
+        fallbacks=[CommandHandler('cancel', login_cancel)],
+    )
+
+    # /reserve conv. 콜백 위주.
+    reserve_conv = ConversationHandler(
         entry_points=[CommandHandler('reserve', conv_start)],
         states={
             ASK_DATE: [CallbackQueryHandler(conv_date, pattern=r"^(date:|cancel$)")],
@@ -819,12 +1060,16 @@ def main():
 
     app.add_handler(CommandHandler('start', cmd_start))
     app.add_handler(CommandHandler('help', cmd_help))
+    app.add_handler(CommandHandler('whoami', cmd_whoami))
+    app.add_handler(CommandHandler('logout', cmd_logout))
     app.add_handler(CommandHandler('reservations', cmd_reservations))
+    app.add_handler(CommandHandler('hunts', cmd_hunts))
     app.add_handler(CommandHandler('hunt_stop', cmd_hunt_stop))
     app.add_handler(CallbackQueryHandler(cb_hunt_stop, pattern=r"^stop:"))
-    app.add_handler(conv)
+    app.add_handler(login_conv)
+    app.add_handler(reserve_conv)
 
-    logger.info("봇 시작 (인증 chat_id=%s)", authorized_chat_id())
+    logger.info("봇 시작 (인증 chat_ids=%s, 저장된 사용자 %d명)", allowed, len(storage.list_user_ids()))
     app.run_polling()
 
 

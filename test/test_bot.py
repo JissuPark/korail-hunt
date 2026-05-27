@@ -10,7 +10,7 @@ from datetime import date
 from unittest.mock import patch
 
 from bot import (
-    authorized_chat_id,
+    authorized_chat_ids,
     format_reservation_success,
     parse_date,
     parse_time,
@@ -129,25 +129,50 @@ class FormatReservationSuccessTests(unittest.TestCase):
         self.assertIn('(3석)', msg)
 
 
-class AuthorizedChatIdTests(unittest.TestCase):
+class AuthorizedChatIdsTests(unittest.TestCase):
 
-    def test_returns_int_when_set(self):
-        with patch.dict(os.environ, {'TELEGRAM_AUTHORIZED_CHAT_ID': '12345'}):
-            self.assertEqual(authorized_chat_id(), 12345)
-
-    def test_returns_none_when_missing(self):
+    def _clean_env(self, **overrides):
         env = os.environ.copy()
         env.pop('TELEGRAM_AUTHORIZED_CHAT_ID', None)
-        with patch.dict(os.environ, env, clear=True):
-            self.assertIsNone(authorized_chat_id())
+        env.pop('TELEGRAM_AUTHORIZED_CHAT_IDS', None)
+        env.update(overrides)
+        return env
 
-    def test_returns_none_when_not_integer(self):
-        with patch.dict(os.environ, {'TELEGRAM_AUTHORIZED_CHAT_ID': 'abc'}):
-            self.assertIsNone(authorized_chat_id())
+    def test_single_id_plural_var(self):
+        with patch.dict(os.environ, self._clean_env(TELEGRAM_AUTHORIZED_CHAT_IDS='12345'), clear=True):
+            self.assertEqual(authorized_chat_ids(), {12345})
 
-    def test_returns_none_when_empty_string(self):
-        with patch.dict(os.environ, {'TELEGRAM_AUTHORIZED_CHAT_ID': ''}):
-            self.assertIsNone(authorized_chat_id())
+    def test_multiple_ids_comma_separated(self):
+        with patch.dict(os.environ, self._clean_env(TELEGRAM_AUTHORIZED_CHAT_IDS='111,222,333'), clear=True):
+            self.assertEqual(authorized_chat_ids(), {111, 222, 333})
+
+    def test_whitespace_tolerance(self):
+        with patch.dict(os.environ, self._clean_env(TELEGRAM_AUTHORIZED_CHAT_IDS=' 111 , 222 , 333 '), clear=True):
+            self.assertEqual(authorized_chat_ids(), {111, 222, 333})
+
+    def test_singular_var_backward_compat(self):
+        with patch.dict(os.environ, self._clean_env(TELEGRAM_AUTHORIZED_CHAT_ID='12345'), clear=True):
+            self.assertEqual(authorized_chat_ids(), {12345})
+
+    def test_plural_takes_precedence(self):
+        with patch.dict(os.environ, self._clean_env(
+            TELEGRAM_AUTHORIZED_CHAT_ID='999',
+            TELEGRAM_AUTHORIZED_CHAT_IDS='111,222',
+        ), clear=True):
+            self.assertEqual(authorized_chat_ids(), {111, 222})
+
+    def test_empty_returns_empty_set(self):
+        with patch.dict(os.environ, self._clean_env(), clear=True):
+            self.assertEqual(authorized_chat_ids(), set())
+
+    def test_non_integer_entries_skipped(self):
+        with patch.dict(os.environ, self._clean_env(TELEGRAM_AUTHORIZED_CHAT_IDS='111,abc,222'), clear=True):
+            self.assertEqual(authorized_chat_ids(), {111, 222})
+
+    def test_negative_ids_allowed(self):
+        # Telegram 그룹 chat_id 는 음수
+        with patch.dict(os.environ, self._clean_env(TELEGRAM_AUTHORIZED_CHAT_IDS='-100123,456'), clear=True):
+            self.assertEqual(authorized_chat_ids(), {-100123, 456})
 
 
 if __name__ == '__main__':
