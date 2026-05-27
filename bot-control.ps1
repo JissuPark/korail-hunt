@@ -138,8 +138,18 @@ function Show-Logs {
     Write-Host "봇이 한 번도 안 떴거나 BOT_LOG_FILE 미설정 상태로 실행됐을 가능성."
     return
   }
-  Write-Host "[$LogFile] 마지막 100줄부터 tail (Ctrl+C 로 종료)" -ForegroundColor Cyan
-  Get-Content $LogFile -Tail 100 -Wait
+  # bot.py 는 UTF-8 로 로그를 쓴다. PowerShell 5.1 의 Get-Content 는
+  # 기본적으로 시스템 코드페이지(CP949) 로 읽기 때문에 한글이 깨진다.
+  # -Encoding UTF8 명시로 강제.
+  # 콘솔 출력도 UTF-8 로 맞춘다 (Write-Host 가 mojibake 되는 것 방지).
+  $prevOutputEncoding = [Console]::OutputEncoding
+  [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
+  try {
+    Write-Host "[$LogFile] 마지막 100줄부터 tail (Ctrl+C 로 종료)" -ForegroundColor Cyan
+    Get-Content $LogFile -Tail 100 -Wait -Encoding UTF8
+  } finally {
+    [Console]::OutputEncoding = $prevOutputEncoding
+  }
 }
 
 switch ($Command) {
