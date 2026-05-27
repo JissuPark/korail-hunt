@@ -21,6 +21,7 @@ korail-hunt Telegram 봇 (멀티 유저).
   python bot.py
 """
 import asyncio
+import html
 import json
 import logging
 import os
@@ -29,6 +30,10 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from functools import wraps
 from typing import Optional
+
+
+def escape_html(s):
+    return html.escape(str(s))
 
 # 시스템 인증서 저장소(Windows/macOS) 사용. 사내 프록시·백신이 SSL 검사를
 # 하는 환경에서 certifi 번들로는 실패하므로 OS 저장소로 우회한다.
@@ -137,15 +142,17 @@ async def _ensure_login(session: UserSession):
 
 
 def _apply_device_info(session: UserSession, device_info: dict):
-    """저장된 device_info 를 Korail 세션에 적용. device_info=None 이면 건너뜀."""
+    """저장된 device_info 를 Korail 세션에 적용. UA 만 덮어쓴다.
+
+    device_code 는 의도적으로 무시한다 — PatchedKorail 의 DynaPath 우회 토큰이
+    Android('AD') 에 고정돼 있어, 여기서 'iOS' 등으로 바꾸면 서버가 토큰과 device
+    불일치를 잡아 ERR299907 ('사용 불가한 창구/device') 로 거부한다.
+    """
     if not device_info:
         return
     ua = device_info.get('user_agent')
-    code = device_info.get('device_code')
     if ua:
         session.korail._session.headers['User-Agent'] = ua
-    if code:
-        session.korail._device = code
 
 
 def _webapp_keyboard(label="📱 기기 정보 자동 감지"):
@@ -595,21 +602,24 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     info = parse_device_info(payload.get('user_agent', ''), payload.get('platform', ''))
-    if not info.is_usable:
+
+    # iOS / 데스크톱 / Android 파싱 실패: 적용 가능한 Dalvik UA 가 없다.
+    # DynaPath 우회가 Android 전용이라 iOS 의 device_code 변경은 역효과 (ERR299907).
+    if not info.dalvik_ua:
         await update.message.reply_text(
-            f"감지 결과: <b>{info.platform}</b>\n"
-            f"이 플랫폼에서는 Korail 호환 UA 를 만들 수 없다. "
-            f"휴대폰(Android/iOS)의 Telegram 에서 다시 시도하라.\n"
-            f"받은 UA: <code>{payload.get('user_agent', '')[:200]}</code>",
+            f"감지 결과: <b>{info.platform}</b>\n\n"
+            f"이 플랫폼에서는 적용할 UA 를 만들 수 없다 (DynaPath 우회는 Android 전용). "
+            f"기본 UA 그대로 사용하라.\n"
+            f"받은 UA: <code>{escape_html(payload.get('user_agent', '')[:200])}</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=ReplyKeyboardRemove(),
         )
         return
 
-    # 메모리 세션에 즉시 적용
+    # 메모리 세션에 즉시 적용 (UA 만)
     _apply_device_info(session, {
         'user_agent': info.dalvik_ua,
-        'device_code': info.device_code,
+        'device_code': info.device_code,  # 저장은 하지만 _apply 가 무시함
         'platform': info.platform,
     })
     # 저장
@@ -626,9 +636,9 @@ async def handle_webapp_data(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(
         f"✅ 기기 정보 저장됨\n"
         f"플랫폼: <b>{info.platform}</b>\n"
-        f"Device: <code>{info.device_code}</code>\n"
-        f"UA: <code>{info.dalvik_ua or '(기본값 유지)'}</code>\n\n"
-        f"다음 코레일 호출부터 적용된다.",
+        f"UA: <code>{escape_html(info.dalvik_ua)}</code>\n\n"
+        f"다음 코레일 호출부터 적용된다.\n"
+        f"(Device 필드는 DynaPath 호환을 위해 'AD' 로 유지됩니다.)",
         parse_mode=ParseMode.HTML,
         reply_markup=ReplyKeyboardRemove(),
     )
