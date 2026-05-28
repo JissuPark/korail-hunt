@@ -77,6 +77,7 @@ from telegram.ext import (
 
 from korail2 import (
     KorailError,
+    NeedToLoginError,
     NoResultsError,
     PatchedKorail,
     ReserveOption,
@@ -136,9 +137,25 @@ def _get_session(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 
 async def _korail_call(session: UserSession, fn, *args, **kwargs):
-    """세션 단위 lock 으로 직렬화. requests.Session 동시 접근 방지."""
-    async with session.lock:
-        return await asyncio.to_thread(fn, *args, **kwargs)
+    """세션 단위 lock 으로 직렬화 + NeedToLoginError(P058) 자동 재로그인 후 1회 재시도.
+
+    코레일 서버 쪽 세션이 시간 만료되면 local 의 logined=True 가 거짓말이
+    되어 호출이 P058 로 거부된다. 재로그인 + 한 번 재시도가 가장 흔한
+    "헌팅 한참 돌리다 reserve 직전 P058 로 죽음" 시나리오를 살린다.
+    """
+    try:
+        async with session.lock:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+    except NeedToLoginError:
+        logger.info("session expired (P058) — 재로그인 후 재시도")
+        session.korail.logined = False
+        async with session.lock:
+            ok = await asyncio.to_thread(session.korail.login)
+        if not ok:
+            # 재로그인 자체가 실패 — 자격증명/anti-bot 문제. 원래 에러 그대로 올림.
+            raise NeedToLoginError()
+        async with session.lock:
+            return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 async def _ensure_login(session: UserSession):
