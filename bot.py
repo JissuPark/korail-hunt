@@ -269,6 +269,78 @@ async def _payment_alert_callback(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _reload_hunts(app):
+    """봇 시작 시 storage 의 hunts 를 모두 재개. 날짜가 어제 이전이거나
+    자격증명이 사라진 orphan 은 정리."""
+    storage: EncryptedStorage = app.bot_data[KEY_STORAGE]
+    sessions = app.bot_data[KEY_SESSIONS]
+    today_kst = datetime.now(KST).strftime('%Y%m%d')
+
+    # ContextTypes.DEFAULT_TYPE 인스턴스를 생성해서 hunt 루프에 넘긴다.
+    # bot_data, bot, job_queue 는 app 에서 그대로 위임된다.
+    from telegram.ext import CallbackContext
+
+    restored = 0
+    pruned = 0
+    for chat_id, hunt_id, hunt in storage.all_hunts():
+        # 날짜 지난 헌팅 정리
+        if hunt.get('date', '99999999') < today_kst:
+            storage.remove_hunt(chat_id, hunt_id)
+            pruned += 1
+            continue
+
+        # 세션 구성 (자격증명 없으면 orphan)
+        session = sessions.get(chat_id)
+        if session is None:
+            creds = storage.get_user(chat_id)
+            if creds is None:
+                storage.remove_hunt(chat_id, hunt_id)
+                pruned += 1
+                continue
+            korail = PatchedKorail(creds['korail_id'], creds['korail_pw'], auto_login=False)
+            session = UserSession(chat_id=chat_id, korail=korail)
+            _apply_device_info(session, creds.get('device_info'))
+            sessions[chat_id] = session
+
+        # 가짜 context. CallbackContext 는 application 만 있으면 동작.
+        context = CallbackContext(application=app, chat_id=chat_id)
+        chat_hunts = _chat_hunts(context, chat_id)
+        # hunt_id 충돌 회피 (이론상 없지만)
+        if hunt_id in chat_hunts:
+            hunt_id = _next_hunt_id(chat_hunts)
+        label = hunt.get('label', f"{hunt['dep']}→{hunt['arr']}")
+        interval = float(hunt.get('interval', 3.0))
+
+        if hunt.get('type') == 'all':
+            task = asyncio.create_task(
+                _hunt_loop(
+                    context, session, chat_id, hunt_id, label,
+                    hunt['dep'], hunt['arr'], hunt['date'], hunt['time'], interval,
+                )
+            )
+        elif hunt.get('type') == 'train':
+            target = tuple(hunt['target'])
+            task = asyncio.create_task(
+                _train_hunt_loop(
+                    context, session, chat_id, hunt_id, label,
+                    target,
+                    hunt['dep'], hunt['arr'], hunt['date'], hunt['time'],
+                    hunt['option'], interval,
+                )
+            )
+        else:
+            logger.warning("알 수 없는 hunt type: %r — 정리", hunt.get('type'))
+            storage.remove_hunt(chat_id, hunt_id)
+            pruned += 1
+            continue
+
+        chat_hunts[hunt_id] = {'task': task, 'label': label}
+        restored += 1
+
+    if restored or pruned:
+        logger.info("헌팅 복원: %d개, 정리: %d개", restored, pruned)
+
+
 async def _reload_payment_alerts(app):
     """봇 시작 시 저장된 pending_payments 를 모두 JobQueue 에 다시 등록.
     이미 만료된(모든 알림 시점이 과거) 항목은 storage 에서 제거."""
@@ -887,9 +959,10 @@ async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry['task'].cancel()
     # 메모리 세션 제거
     context.bot_data.get(KEY_SESSIONS, {}).pop(chat_id, None)
-    # 저장소에서 자격증명 제거
+    # 저장소: 자격증명 + 헌팅 cascade 제거 (cancel finally 와 race 피함)
     storage: EncryptedStorage = context.bot_data[KEY_STORAGE]
     removed = storage.delete_user(chat_id)
+    storage.clear_user_hunts(chat_id)
     msg = "로그아웃 완료. 자격증명 삭제." if removed else "로그아웃 (저장된 자격증명 없음)."
     if active:
         msg += f"\n진행 중이던 헌팅 {len(active)}개 중단 요청."
@@ -1300,6 +1373,14 @@ async def _start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hunt_id = _next_hunt_id(chat_hunts)
     label = _format_hunt_label(dep, arr, d, t, train=None)
 
+    # storage 영속화 — 봇 재시작 시 재개용
+    storage: EncryptedStorage = context.bot_data[KEY_STORAGE]
+    storage.add_hunt(
+        chat_id, hunt_id,
+        type='all', dep=dep, arr=arr, date=d, time=t,
+        label=label, interval=interval,
+    )
+
     await update.effective_message.reply_text(
         f"[{hunt_id}] {label}\n전체 헌팅 시작 (간격 {interval}s). /hunt_stop 으로 중단."
     )
@@ -1364,6 +1445,11 @@ async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t, 
         raise
     finally:
         _chat_hunts(context, chat_id).pop(hunt_id, None)
+        # 어떤 이유로 끝나든 storage 에서 제거 — 재시작 시 이미 끝난 헌팅 재개 방지
+        try:
+            context.bot_data[KEY_STORAGE].remove_hunt(chat_id, hunt_id)
+        except Exception:
+            logger.exception("hunt[%s] storage cleanup 실패", hunt_id)
 
 
 async def _start_train_hunt(update, context, train_idx, option):
@@ -1384,6 +1470,16 @@ async def _start_train_hunt(update, context, train_idx, option):
 
     hunt_id = _next_hunt_id(chat_hunts)
     label = _format_hunt_label(dep, arr, d, t, train=train)
+
+    # storage 영속화
+    storage: EncryptedStorage = context.bot_data[KEY_STORAGE]
+    storage.add_hunt(
+        chat_id, hunt_id,
+        type='train', dep=dep, arr=arr, date=d, time=t,
+        target=list(target),
+        option=option,
+        label=label, interval=interval,
+    )
 
     await update.effective_message.reply_text(
         f"[{hunt_id}] {label}\n옵션: {option}, 간격 {interval}s. /hunt_stop 으로 중단."
@@ -1456,6 +1552,10 @@ async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target, de
         raise
     finally:
         _chat_hunts(context, chat_id).pop(hunt_id, None)
+        try:
+            context.bot_data[KEY_STORAGE].remove_hunt(chat_id, hunt_id)
+        except Exception:
+            logger.exception("train hunt[%s] storage cleanup 실패", hunt_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1526,6 +1626,7 @@ def _main_body():
 
     async def post_init(app):
         await _reload_payment_alerts(app)
+        await _reload_hunts(app)
 
     app = Application.builder().token(token).post_init(post_init).build()
     app.bot_data[KEY_STORAGE] = storage

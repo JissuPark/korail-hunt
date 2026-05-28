@@ -241,6 +241,74 @@ class EncryptedStorageTests(unittest.TestCase):
         # 내부 상태는 그대로
         self.assertEqual(s.list_pending_payments(123)[0]['rsv_id'], 'PNR1')
 
+    # --- hunts ---
+
+    def test_add_and_list_hunt(self):
+        s = self._open()
+        s.add_hunt(123, 'h1', type='all', dep='서울', arr='부산',
+                   date='20260530', time='100000', label='전체 ...', interval=3.0)
+        hunts = s.list_hunts(123)
+        self.assertEqual(len(hunts), 1)
+        self.assertEqual(hunts[0]['hunt_id'], 'h1')
+        self.assertEqual(hunts[0]['dep'], '서울')
+
+    def test_hunt_persists(self):
+        s = self._open()
+        s.add_hunt(123, 'h1', type='all', dep='서울', arr='부산',
+                   date='20260530', time='100000', label='x', interval=3.0)
+        s2 = self._open()
+        self.assertEqual(len(s2.list_hunts(123)), 1)
+
+    def test_remove_hunt(self):
+        s = self._open()
+        s.add_hunt(123, 'h1', type='all', dep='x', arr='y',
+                   date='20260530', time='100000', label='x', interval=3.0)
+        self.assertTrue(s.remove_hunt(123, 'h1'))
+        self.assertEqual(s.list_hunts(123), [])
+        self.assertFalse(s.remove_hunt(123, 'h1'))
+
+    def test_train_hunt_with_target_and_option(self):
+        s = self._open()
+        s.add_hunt(456, 'h2', type='train', dep='서울', arr='부산',
+                   date='20260530', time='100000',
+                   target=['001', '20260530', '100000'],
+                   option='SPECIAL_FIRST',
+                   label='[KTX 001] ...', interval=3.0)
+        hunts = s.list_hunts(456)
+        self.assertEqual(hunts[0]['type'], 'train')
+        self.assertEqual(hunts[0]['target'], ['001', '20260530', '100000'])
+        self.assertEqual(hunts[0]['option'], 'SPECIAL_FIRST')
+
+    def test_all_hunts_across_users(self):
+        s = self._open()
+        s.add_hunt(111, 'h1', type='all', dep='x', arr='y',
+                   date='20260530', time='100000', label='a', interval=3.0)
+        s.add_hunt(111, 'h2', type='all', dep='x', arr='y',
+                   date='20260601', time='120000', label='b', interval=3.0)
+        s.add_hunt(222, 'h1', type='all', dep='x', arr='y',
+                   date='20260530', time='100000', label='c', interval=3.0)
+        all_h = s.all_hunts()
+        self.assertEqual(len(all_h), 3)
+        chat_ids = {chat_id for chat_id, _, _ in all_h}
+        self.assertEqual(chat_ids, {111, 222})
+        for chat_id, _, _ in all_h:
+            self.assertIsInstance(chat_id, int)
+
+    def test_clear_user_hunts_removes_all(self):
+        s = self._open()
+        s.add_hunt(111, 'h1', type='all', dep='x', arr='y',
+                   date='20260530', time='100000', label='a', interval=3.0)
+        s.add_hunt(111, 'h2', type='all', dep='x', arr='y',
+                   date='20260601', time='120000', label='b', interval=3.0)
+        s.add_hunt(222, 'h1', type='all', dep='x', arr='y',
+                   date='20260530', time='100000', label='c', interval=3.0)
+        self.assertTrue(s.clear_user_hunts(111))
+        self.assertEqual(s.list_hunts(111), [])
+        # 다른 사용자는 영향 없음
+        self.assertEqual(len(s.list_hunts(222)), 1)
+        # 두 번째 clear 는 False
+        self.assertFalse(s.clear_user_hunts(111))
+
 
 if __name__ == '__main__':
     unittest.main()

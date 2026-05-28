@@ -167,3 +167,50 @@ class EncryptedStorage:
                 for payment in user_payments.values():
                     out.append((int(chat_id_str), dict(payment)))
             return out
+
+    # --- 공개 API: 헌팅 ---------------------------------------------------
+    # 백그라운드 헌팅 task 의 조건. 봇 재시작 시 다시 spawn 한다.
+    # hunt_id 는 chat 단위 'h1', 'h2', ... 형식.
+
+    def add_hunt(self, chat_id, hunt_id, **fields):
+        """fields: type, dep, arr, date, time, label, interval,
+        그리고 train hunt 는 추가로 target(=[no, dep_date, dep_time]), option."""
+        with self._lock:
+            hunts = self._data.setdefault('hunts', {})
+            user_hunts = hunts.setdefault(str(chat_id), {})
+            user_hunts[str(hunt_id)] = dict(fields)
+            self._save()
+
+    def remove_hunt(self, chat_id, hunt_id):
+        with self._lock:
+            user_hunts = self._data.get('hunts', {}).get(str(chat_id), {})
+            existed = str(hunt_id) in user_hunts
+            user_hunts.pop(str(hunt_id), None)
+            if existed:
+                self._save()
+            return existed
+
+    def list_hunts(self, chat_id):
+        """[{hunt_id, ...fields}, ...]"""
+        with self._lock:
+            user_hunts = self._data.get('hunts', {}).get(str(chat_id), {})
+            return [dict(h, hunt_id=hid) for hid, h in user_hunts.items()]
+
+    def all_hunts(self):
+        """[(chat_id, hunt_id, fields), ...] — 봇 시작 시 재개용."""
+        with self._lock:
+            out = []
+            for chat_id_str, user_hunts in self._data.get('hunts', {}).items():
+                for hunt_id, hunt in user_hunts.items():
+                    out.append((int(chat_id_str), hunt_id, dict(hunt)))
+            return out
+
+    def clear_user_hunts(self, chat_id):
+        """logout/계정 정리 시 cascade 제거."""
+        with self._lock:
+            hunts = self._data.get('hunts', {})
+            existed = str(chat_id) in hunts
+            hunts.pop(str(chat_id), None)
+            if existed:
+                self._save()
+            return existed
