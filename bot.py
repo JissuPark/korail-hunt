@@ -76,6 +76,7 @@ from telegram.ext import (
 )
 
 from korail2 import (
+    AdultPassenger,
     KorailError,
     NeedToLoginError,
     NoResultsError,
@@ -88,7 +89,7 @@ from korail2.storage import EncryptedStorage, StorageKeyError, generate_key
 logger = logging.getLogger(__name__)
 
 # ConversationHandler states — /reserve
-ASK_DATE, ASK_TIME, ASK_DEP, ASK_ARR, SELECT_TRAIN, SELECT_OPTION = range(6)
+ASK_DATE, ASK_TIME, ASK_DEP, ASK_ARR, ASK_PASSENGERS, SELECT_TRAIN, SELECT_OPTION = range(7)
 # ConversationHandler states — /login (다른 conv 와 안 겹치게 100번대)
 LOGIN_ASK_ID, LOGIN_ASK_PW = range(100, 102)
 
@@ -97,6 +98,7 @@ KEY_DATE = 'date'
 KEY_TIME = 'time'
 KEY_DEP = 'dep'
 KEY_ARR = 'arr'
+KEY_PASSENGERS = 'passengers'  # 어른 인원수 (int)
 KEY_TRAINS = 'trains'
 KEY_SELECTED_TRAIN_IDX = 'sel'
 KEY_LOGIN_ID = 'login_id'
@@ -310,12 +312,15 @@ async def _reload_hunts(app):
             hunt_id = _next_hunt_id(chat_hunts)
         label = hunt.get('label', f"{hunt['dep']}→{hunt['arr']}")
         interval = float(hunt.get('interval', 3.0))
+        # 구버전 storage 호환: passenger_count 없으면 1
+        passenger_count = int(hunt.get('passenger_count', 1))
 
         if hunt.get('type') == 'all':
             task = asyncio.create_task(
                 _hunt_loop(
                     context, session, chat_id, hunt_id, label,
-                    hunt['dep'], hunt['arr'], hunt['date'], hunt['time'], interval,
+                    hunt['dep'], hunt['arr'], hunt['date'], hunt['time'],
+                    passenger_count, interval,
                 )
             )
         elif hunt.get('type') == 'train':
@@ -325,7 +330,7 @@ async def _reload_hunts(app):
                     context, session, chat_id, hunt_id, label,
                     target,
                     hunt['dep'], hunt['arr'], hunt['date'], hunt['time'],
-                    hunt['option'], interval,
+                    passenger_count, hunt['option'], interval,
                 )
             )
         else:
@@ -981,14 +986,12 @@ async def cmd_hunt_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("진행 중인 헌팅 없음")
         return
 
-    if len(active) == 1:
-        next(iter(active.values()))['task'].cancel()
-        return
-
+    # 1개여도 버튼 노출 (사용자가 의도치 않게 중단하는 일 방지)
     rows = []
     for hid, entry in active.items():
         rows.append([InlineKeyboardButton(f"[{hid}] {entry['label']}", callback_data=f"stop:{hid}")])
-    rows.append([InlineKeyboardButton("⛔ 전부 중단", callback_data="stop:all")])
+    if len(active) > 1:
+        rows.append([InlineKeyboardButton("⛔ 전부 중단", callback_data="stop:all")])
     rows.append([InlineKeyboardButton("닫기", callback_data="stop:close")])
     await update.message.reply_text(
         f"중단할 헌팅 선택 ({len(active)}개 진행 중):",
@@ -1084,6 +1087,15 @@ def _time_keyboard():
     return InlineKeyboardMarkup(rows)
 
 
+def _passenger_keyboard():
+    """어른 인원수 선택 (1~6). 코레일 예약 단위 1팀당 한 번 처리."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{n}명", callback_data=f"psg:{n}") for n in (1, 2, 3)],
+        [InlineKeyboardButton(f"{n}명", callback_data=f"psg:{n}") for n in (4, 5, 6)],
+        [InlineKeyboardButton("취소", callback_data="cancel")],
+    ])
+
+
 @restricted
 async def conv_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1171,12 +1183,40 @@ async def conv_arr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_ARR
     station = query.data.split(":", 1)[1]
     context.user_data[KEY_ARR] = station
-    await query.edit_message_text(f"도착역: {station}\n\n열차 검색 중...")
-    return await _show_trains(update, context)
+    await query.edit_message_text(
+        f"도착역: {station}\n\n"
+        f"인원 선택 (어른 기준):\n"
+        f"⚠️ 한 번에 예약하지 않으면 코레일이 중복으로 막을 수 있다.",
+        reply_markup=_passenger_keyboard(),
+    )
+    return ASK_PASSENGERS
 
 
 async def conv_arr_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[KEY_ARR] = update.message.text.strip()
+    await update.message.reply_text(
+        f"도착역: {context.user_data[KEY_ARR]}\n\n"
+        f"인원 선택 (어른 기준):\n"
+        f"⚠️ 한 번에 예약하지 않으면 코레일이 중복으로 막을 수 있다.",
+        reply_markup=_passenger_keyboard(),
+    )
+    return ASK_PASSENGERS
+
+
+async def conv_passengers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "cancel":
+        await query.edit_message_text("취소됨.")
+        return ConversationHandler.END
+    if not query.data.startswith("psg:"):
+        return ASK_PASSENGERS
+    n = int(query.data.split(":", 1)[1])
+    context.user_data[KEY_PASSENGERS] = n
+    await query.edit_message_text(
+        f"인원: <b>{n}명</b>\n\n열차 검색 중...",
+        parse_mode=ParseMode.HTML,
+    )
     return await _show_trains(update, context)
 
 
@@ -1190,11 +1230,14 @@ async def _show_trains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arr = context.user_data[KEY_ARR]
     d = context.user_data[KEY_DATE]
     t = context.user_data[KEY_TIME]
+    n = context.user_data.get(KEY_PASSENGERS, 1)
+    passengers = [AdultPassenger(n)]
 
     await _ensure_login(session)
     try:
         trains = await _korail_call(
-            session, session.korail.search_train, dep, arr, d, t, include_no_seats=True,
+            session, session.korail.search_train, dep, arr, d, t,
+            passengers=passengers, include_no_seats=True,
         )
     except NoResultsError:
         trains = []
@@ -1202,19 +1245,21 @@ async def _show_trains(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"검색 실패: {e}")
         return ConversationHandler.END
 
+    header = f"{dep} → {arr} {d} {t} · 어른 {n}명"
+
     if not trains:
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🔁 헌팅 시작", callback_data="hunt"),
             InlineKeyboardButton("취소", callback_data="cancel"),
         ]])
         await update.effective_message.reply_text(
-            f"{dep} → {arr} {d} {t}\n좌석 없음.",
+            f"{header}\n좌석 없음.",
             reply_markup=kb,
         )
         return SELECT_TRAIN
 
     context.user_data[KEY_TRAINS] = trains
-    text_lines = [f"{dep} → {arr} {d} {t}", ""]
+    text_lines = [header, ""]
     buttons = []
     for i, tr in enumerate(trains):
         marker = "" if tr.has_seat() else " (매진)"
@@ -1287,16 +1332,18 @@ async def conv_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
     option = getattr(ReserveOption, query.data.split(":", 1)[1])
     train_idx = context.user_data[KEY_SELECTED_TRAIN_IDX]
     train = context.user_data[KEY_TRAINS][train_idx]
+    n = context.user_data.get(KEY_PASSENGERS, 1)
+    passengers = [AdultPassenger(n)]
 
     if not train.has_seat():
-        await query.edit_message_text(f"{train!r}\n좌석 없음 — 이 열차 헌팅 시작")
+        await query.edit_message_text(f"{train!r}\n좌석 없음 — 이 열차 헌팅 시작 ({n}명)")
         await _start_train_hunt(update, context, train_idx, option)
         return ConversationHandler.END
 
-    await query.edit_message_text(f"예약 중... {train!r}")
+    await query.edit_message_text(f"예약 중... {train!r} ({n}명)")
     await _ensure_login(session)
     try:
-        rsv = await _korail_call(session, session.korail.reserve, train, None, option, False)
+        rsv = await _korail_call(session, session.korail.reserve, train, passengers, option, False)
     except SoldOutError:
         await update.effective_message.reply_text(
             f"{train!r}\n예약 직전 매진 — 이 열차 헌팅 시작"
@@ -1368,6 +1415,7 @@ async def _start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arr = context.user_data[KEY_ARR]
     d = context.user_data[KEY_DATE]
     t = context.user_data[KEY_TIME]
+    passenger_count = context.user_data.get(KEY_PASSENGERS, 1)
     interval = float(os.environ.get('TELEGRAM_HUNT_INTERVAL', '3'))
 
     hunt_id = _next_hunt_id(chat_hunts)
@@ -1378,21 +1426,26 @@ async def _start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     storage.add_hunt(
         chat_id, hunt_id,
         type='all', dep=dep, arr=arr, date=d, time=t,
+        passenger_count=passenger_count,
         label=label, interval=interval,
     )
 
     await update.effective_message.reply_text(
-        f"[{hunt_id}] {label}\n전체 헌팅 시작 (간격 {interval}s). /hunt_stop 으로 중단."
+        f"[{hunt_id}] {label} · 어른 {passenger_count}명\n"
+        f"전체 헌팅 시작 (간격 {interval}s). /hunt_stop 으로 중단."
     )
 
     task = asyncio.create_task(
-        _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t, interval)
+        _hunt_loop(context, session, chat_id, hunt_id, label,
+                   dep, arr, d, t, passenger_count, interval)
     )
     chat_hunts[hunt_id] = {'task': task, 'label': label}
 
 
-async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t, interval):
+async def _hunt_loop(context, session, chat_id, hunt_id, label,
+                     dep, arr, d, t, passenger_count, interval):
     bot = context.bot
+    passengers = [AdultPassenger(passenger_count)]
     attempts = 0
     try:
         while True:
@@ -1401,6 +1454,7 @@ async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t, 
                 await _ensure_login(session)
                 trains = await _korail_call(
                     session, session.korail.search_train_allday, dep, arr, d, t,
+                    passengers=passengers,
                 )
             except NoResultsError:
                 await asyncio.sleep(interval)
@@ -1417,7 +1471,7 @@ async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t, 
 
             try:
                 rsv = await _korail_call(
-                    session, session.korail.reserve, trains[0], None, ReserveOption.GENERAL_FIRST, False,
+                    session, session.korail.reserve, trains[0], passengers, ReserveOption.GENERAL_FIRST, False,
                 )
             except SoldOutError:
                 await asyncio.sleep(interval)
@@ -1466,6 +1520,7 @@ async def _start_train_hunt(update, context, train_idx, option):
     arr = context.user_data[KEY_ARR]
     d = context.user_data[KEY_DATE]
     t = context.user_data[KEY_TIME]
+    passenger_count = context.user_data.get(KEY_PASSENGERS, 1)
     interval = float(os.environ.get('TELEGRAM_HUNT_INTERVAL', '3'))
 
     hunt_id = _next_hunt_id(chat_hunts)
@@ -1478,21 +1533,26 @@ async def _start_train_hunt(update, context, train_idx, option):
         type='train', dep=dep, arr=arr, date=d, time=t,
         target=list(target),
         option=option,
+        passenger_count=passenger_count,
         label=label, interval=interval,
     )
 
     await update.effective_message.reply_text(
-        f"[{hunt_id}] {label}\n옵션: {option}, 간격 {interval}s. /hunt_stop 으로 중단."
+        f"[{hunt_id}] {label} · 어른 {passenger_count}명\n"
+        f"옵션: {option}, 간격 {interval}s. /hunt_stop 으로 중단."
     )
 
     task = asyncio.create_task(
-        _train_hunt_loop(context, session, chat_id, hunt_id, label, target, dep, arr, d, t, option, interval)
+        _train_hunt_loop(context, session, chat_id, hunt_id, label, target,
+                         dep, arr, d, t, passenger_count, option, interval)
     )
     chat_hunts[hunt_id] = {'task': task, 'label': label}
 
 
-async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target, dep, arr, d, t, option, interval):
+async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target,
+                           dep, arr, d, t, passenger_count, option, interval):
     bot = context.bot
+    passengers = [AdultPassenger(passenger_count)]
     attempts = 0
     try:
         while True:
@@ -1500,7 +1560,8 @@ async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target, de
             try:
                 await _ensure_login(session)
                 trains = await _korail_call(
-                    session, session.korail.search_train, dep, arr, d, t, include_no_seats=True,
+                    session, session.korail.search_train, dep, arr, d, t,
+                    passengers=passengers, include_no_seats=True,
                 )
             except NoResultsError:
                 await asyncio.sleep(interval)
@@ -1525,7 +1586,7 @@ async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target, de
                 continue
 
             try:
-                rsv = await _korail_call(session, session.korail.reserve, match, None, option, False)
+                rsv = await _korail_call(session, session.korail.reserve, match, passengers, option, False)
             except SoldOutError:
                 await asyncio.sleep(interval)
                 continue
@@ -1659,6 +1720,7 @@ def _main_body():
                 CallbackQueryHandler(conv_arr, pattern=r"^(arr:|cancel$)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, conv_arr_text),
             ],
+            ASK_PASSENGERS: [CallbackQueryHandler(conv_passengers, pattern=r"^(psg:|cancel$)")],
             SELECT_TRAIN: [CallbackQueryHandler(conv_train_pick, pattern=r"^(train:|hunt$|cancel$)")],
             SELECT_OPTION: [CallbackQueryHandler(conv_option, pattern=r"^(opt:|cancel$)")],
         },
