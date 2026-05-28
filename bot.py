@@ -27,9 +27,15 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 from typing import Optional
+
+# 코레일 결제 기한은 한국시간(KST) 기준.
+KST = timezone(timedelta(hours=9))
+
+# 결제기한 N분 전에 알림. 이 순서대로 스케줄된다.
+PAYMENT_ALERT_MINUTES = [10, 5, 3, 1]
 
 
 def escape_html(s):
@@ -155,6 +161,124 @@ def _apply_device_info(session: UserSession, device_info: dict):
         session.korail._session.headers['User-Agent'] = ua
 
 
+def _alert_job_name(chat_id, rsv_id, minutes_before):
+    """JobQueue 내에서 알림 잡을 식별하는 이름. 취소 시 이 이름으로 찾는다."""
+    return f"pay_{chat_id}_{rsv_id}_{minutes_before}"
+
+
+def _schedule_payment_alerts(job_queue, storage, chat_id, *,
+                              rsv_id, deadline_iso, repr_text, price, seat_count,
+                              persist=True):
+    """결제기한 N분 전 알림 잡 등록 + (옵션) storage 저장.
+    deadline 이 너무 임박해서 모든 알림 시점이 과거면 아무것도 하지 않는다."""
+    deadline = datetime.fromisoformat(deadline_iso)
+    now = datetime.now(KST)
+
+    scheduled = []
+    for minutes_before in PAYMENT_ALERT_MINUTES:
+        at = deadline - timedelta(minutes=minutes_before)
+        if at > now:
+            scheduled.append((minutes_before, at))
+
+    if not scheduled:
+        return 0
+
+    if persist:
+        storage.add_pending_payment(
+            chat_id, rsv_id,
+            deadline_iso=deadline_iso,
+            repr_text=repr_text,
+            price=price,
+            seat_count=seat_count,
+        )
+
+    for minutes_before, at in scheduled:
+        job_queue.run_once(
+            _payment_alert_callback,
+            when=at,
+            chat_id=chat_id,
+            name=_alert_job_name(chat_id, rsv_id, minutes_before),
+            data={
+                'rsv_id': rsv_id,
+                'minutes_before': minutes_before,
+                'deadline_iso': deadline_iso,
+                'repr_text': repr_text,
+                'price': price,
+                'seat_count': seat_count,
+            },
+        )
+    return len(scheduled)
+
+
+def _schedule_alerts_for_rsv(context, chat_id, rsv):
+    """예약 성공 직후 호출용 wrapper."""
+    if context.job_queue is None:
+        logger.warning("JobQueue 없음 — 결제 알림 등록 안 됨. pip install '.[bot]' 권장.")
+        return
+    storage = context.bot_data[KEY_STORAGE]
+    deadline = _deadline_kst(rsv.buy_limit_date, rsv.buy_limit_time)
+    n = _schedule_payment_alerts(
+        context.job_queue, storage, chat_id,
+        rsv_id=rsv.rsv_id,
+        deadline_iso=deadline.isoformat(),
+        repr_text=repr(rsv),
+        price=rsv.price,
+        seat_count=rsv.seat_no_count,
+    )
+    logger.info("결제 알림 %d개 등록 (chat=%s, rsv=%s)", n, chat_id, rsv.rsv_id)
+
+
+async def _payment_alert_callback(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue 가 발화 시 호출. 알림 메시지 + [결제완료] 버튼."""
+    job = context.job
+    data = job.data
+    deadline = datetime.fromisoformat(data['deadline_iso'])
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ 결제완료 (알림 끄기)",
+            callback_data=f"paid:{data['rsv_id']}",
+        )
+    ]])
+    await context.bot.send_message(
+        job.chat_id,
+        f"⏰ <b>결제 {data['minutes_before']}분 전</b>\n\n"
+        f"{escape_html(data['repr_text'])}\n\n"
+        f"<b>예약번호</b>: <code>{escape_html(data['rsv_id'])}</code>\n"
+        f"<b>기한</b>: {deadline.strftime('%H:%M')} ({data['minutes_before']}분 남음)\n"
+        f"<b>금액</b>: {data['price']:,}원 ({data['seat_count']}석)\n\n"
+        f"코레일톡 앱 → 승차권 → 결제대기",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+async def _reload_payment_alerts(app):
+    """봇 시작 시 저장된 pending_payments 를 모두 JobQueue 에 다시 등록.
+    이미 만료된(모든 알림 시점이 과거) 항목은 storage 에서 제거."""
+    if app.job_queue is None:
+        logger.warning("JobQueue 없음 — 저장된 결제 알림 복원 안 됨")
+        return
+    storage = app.bot_data[KEY_STORAGE]
+    reloaded = 0
+    pruned = 0
+    for chat_id, payment in storage.all_pending_payments():
+        n = _schedule_payment_alerts(
+            app.job_queue, storage, chat_id,
+            rsv_id=payment['rsv_id'],
+            deadline_iso=payment['deadline_iso'],
+            repr_text=payment['repr_text'],
+            price=payment['price'],
+            seat_count=payment['seat_count'],
+            persist=False,
+        )
+        if n > 0:
+            reloaded += n
+        else:
+            storage.remove_pending_payment(chat_id, payment['rsv_id'])
+            pruned += 1
+    logger.info("결제 알림 복원: 잡 %d개, 만료 정리 %d건", reloaded, pruned)
+
+
 def _webapp_keyboard(label="📱 기기 정보 자동 감지"):
     """기기 감지 WebApp 버튼이 달린 reply keyboard. URL 미설정 시 None."""
     url = os.environ.get('TELEGRAM_WEBAPP_URL')
@@ -276,8 +400,16 @@ def format_reservation_success(rsv):
         f"<b>구매기한</b>: {buy_dt} {buy_tm}\n"
         f"<b>금액</b>: {rsv.price:,}원 ({rsv.seat_no_count}석)\n\n"
         f"코레일톡 앱 → 승차권 → 결제대기에서 결제하라.\n"
-        f"기한 초과 시 자동 취소된다."
+        f"기한 초과 시 자동 취소된다.\n"
+        f"⏰ 기한 {'/'.join(str(m) for m in PAYMENT_ALERT_MINUTES)}분 전에 자동 알림."
     )
+
+
+def _deadline_kst(buy_limit_date: str, buy_limit_time: str) -> datetime:
+    """'20260530', '140500' → tz-aware KST datetime."""
+    return datetime.strptime(
+        f"{buy_limit_date}{buy_limit_time}", "%Y%m%d%H%M%S"
+    ).replace(tzinfo=KST)
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +483,7 @@ HELP_TEXT = (
     "<b>예약</b>\n"
     "/reserve - 예약 시작\n"
     "/reservations - 현재 예약\n"
+    "/payments - 결제 대기 + 알림 끄기 (예약 시 자동 10/5/3/1분 전 알림)\n"
     "\n"
     "<b>헌팅</b>\n"
     "/hunts - 진행 중인 헌팅\n"
@@ -417,6 +550,83 @@ async def cmd_reservations(update: Update, context: ContextTypes.DEFAULT_TYPE, s
         return
     text = "현재 예약:\n" + "\n".join(repr(r) for r in rsvs)
     await update.message.reply_text(text)
+
+
+@restricted
+async def cmd_payments(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """대기 중인 결제 목록 + 각각 결제완료 처리 버튼."""
+    chat_id = update.effective_chat.id
+    storage: EncryptedStorage = context.bot_data[KEY_STORAGE]
+    payments = storage.list_pending_payments(chat_id)
+    if not payments:
+        await update.message.reply_text("대기 중인 결제 없음")
+        return
+
+    now = datetime.now(KST)
+    lines = ["<b>대기 중 결제:</b>"]
+    rows = []
+    for p in payments:
+        deadline = datetime.fromisoformat(p['deadline_iso'])
+        remaining = deadline - now
+        if remaining.total_seconds() <= 0:
+            remain_str = "기한 지남"
+        else:
+            mins = int(remaining.total_seconds() // 60)
+            if mins >= 60:
+                remain_str = f"{mins // 60}시간 {mins % 60}분"
+            else:
+                remain_str = f"{mins}분"
+        lines.append(
+            f"\n[<code>{escape_html(p['rsv_id'])}</code>] {escape_html(p['repr_text'])}\n"
+            f"  {p['price']:,}원 ({p['seat_count']}석) — <b>기한까지 {remain_str}</b>"
+        )
+        rows.append([InlineKeyboardButton(
+            f"✅ {p['rsv_id']} 결제완료",
+            callback_data=f"paid:{p['rsv_id']}",
+        )])
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def cb_payment_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """알림 메시지 / /payments 의 [결제완료] 버튼 콜백.
+    pending_payment 제거 + 남은 알림 잡 모두 취소."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
+    if not query.data.startswith("paid:"):
+        return
+    rsv_id = query.data.split(":", 1)[1]
+
+    storage: EncryptedStorage = context.bot_data[KEY_STORAGE]
+    removed = storage.remove_pending_payment(chat_id, rsv_id)
+
+    cancelled = 0
+    if context.job_queue is not None:
+        for minutes_before in PAYMENT_ALERT_MINUTES:
+            for job in context.job_queue.get_jobs_by_name(
+                _alert_job_name(chat_id, rsv_id, minutes_before)
+            ):
+                job.schedule_removal()
+                cancelled += 1
+
+    suffix = (
+        f"\n\n✅ <b>결제완료 처리</b>. 남은 알림 {cancelled}개 취소."
+        if removed else
+        f"\n\n(이미 처리된 항목)"
+    )
+    # 가능한 한 원본 메시지에 suffix 만 추가. HTML 보존을 위해 text_html 사용.
+    try:
+        await query.edit_message_text(
+            (query.message.text_html or query.message.text or '') + suffix,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        # edit 실패 시 새 메시지로 fallback
+        await context.bot.send_message(chat_id, suffix.strip())
 
 
 @restricted
@@ -1013,6 +1223,7 @@ async def conv_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    _schedule_alerts_for_rsv(context, update.effective_chat.id, rsv)
     await update.effective_message.reply_text(
         format_reservation_success(rsv),
         parse_mode=ParseMode.HTML,
@@ -1124,6 +1335,7 @@ async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t, 
                 )
                 return
 
+            _schedule_alerts_for_rsv(context, chat_id, rsv)
             await bot.send_message(
                 chat_id,
                 f"🎉 [{hunt_id}] {label}\n헌팅 성공 ({attempts}회 시도)\n\n{format_reservation_success(rsv)}",
@@ -1215,6 +1427,7 @@ async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target, de
                 )
                 return
 
+            _schedule_alerts_for_rsv(context, chat_id, rsv)
             await bot.send_message(
                 chat_id,
                 f"🎉 [{hunt_id}] {label}\n열차 헌팅 성공 ({attempts}회 시도)\n\n{format_reservation_success(rsv)}",
@@ -1294,7 +1507,10 @@ def _main_body():
 
     storage = _init_storage()
 
-    app = Application.builder().token(token).build()
+    async def post_init(app):
+        await _reload_payment_alerts(app)
+
+    app = Application.builder().token(token).post_init(post_init).build()
     app.bot_data[KEY_STORAGE] = storage
     app.bot_data[KEY_SESSIONS] = {}
     app.bot_data[KEY_HUNT_TASKS] = {}
@@ -1337,11 +1553,13 @@ def _main_body():
     app.add_handler(CommandHandler('whoami', cmd_whoami))
     app.add_handler(CommandHandler('logout', cmd_logout))
     app.add_handler(CommandHandler('reservations', cmd_reservations))
+    app.add_handler(CommandHandler('payments', cmd_payments))
     app.add_handler(CommandHandler('hunts', cmd_hunts))
     app.add_handler(CommandHandler('hunt_stop', cmd_hunt_stop))
     app.add_handler(CommandHandler('setdevice', cmd_setdevice))
     app.add_handler(CommandHandler('cleardevice', cmd_cleardevice))
     app.add_handler(CallbackQueryHandler(cb_hunt_stop, pattern=r"^stop:"))
+    app.add_handler(CallbackQueryHandler(cb_payment_done, pattern=r"^paid:"))
     # WebApp 에서 sendData 로 들어오는 메시지
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_webapp_data))
     app.add_handler(login_conv)

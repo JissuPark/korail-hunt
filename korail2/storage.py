@@ -126,3 +126,44 @@ class EncryptedStorage:
     def list_user_ids(self):
         with self._lock:
             return [int(k) for k in self._data.get('users', {}).keys()]
+
+    # --- 공개 API: 결제 대기 ---------------------------------------------
+    # 예약 후 결제 기한 알림을 위해 봇 재시작 시에도 살아남는 메타데이터.
+    # 한 사용자에 여러 개 대기 가능, rsv_id 가 유일 키.
+
+    def add_pending_payment(self, chat_id, rsv_id, *,
+                            deadline_iso, repr_text, price, seat_count):
+        with self._lock:
+            payments = self._data.setdefault('pending_payments', {})
+            user_payments = payments.setdefault(str(chat_id), {})
+            user_payments[str(rsv_id)] = {
+                'rsv_id': rsv_id,
+                'deadline_iso': deadline_iso,
+                'repr_text': repr_text,
+                'price': price,
+                'seat_count': seat_count,
+            }
+            self._save()
+
+    def remove_pending_payment(self, chat_id, rsv_id):
+        with self._lock:
+            payments = self._data.get('pending_payments', {}).get(str(chat_id), {})
+            existed = str(rsv_id) in payments
+            payments.pop(str(rsv_id), None)
+            if existed:
+                self._save()
+            return existed
+
+    def list_pending_payments(self, chat_id):
+        with self._lock:
+            payments = self._data.get('pending_payments', {}).get(str(chat_id), {})
+            return [dict(v) for v in payments.values()]
+
+    def all_pending_payments(self):
+        """[(chat_id, payment_dict), ...] — 봇 시작 시 알림 재스케줄용."""
+        with self._lock:
+            out = []
+            for chat_id_str, user_payments in self._data.get('pending_payments', {}).items():
+                for payment in user_payments.values():
+                    out.append((int(chat_id_str), dict(payment)))
+            return out

@@ -178,6 +178,69 @@ class EncryptedStorageTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             s.set_user_device(99999, user_agent='x')
 
+    # --- pending_payments ---
+
+    def test_add_and_list_pending_payment(self):
+        s = self._open()
+        s.add_pending_payment(123, 'PNR1', deadline_iso='2026-05-30T14:05:00+09:00',
+                              repr_text='[KTX] 서울→부산', price=59800, seat_count=1)
+        payments = s.list_pending_payments(123)
+        self.assertEqual(len(payments), 1)
+        self.assertEqual(payments[0]['rsv_id'], 'PNR1')
+        self.assertEqual(payments[0]['price'], 59800)
+
+    def test_pending_payment_persists(self):
+        s = self._open()
+        s.add_pending_payment(123, 'PNR1', deadline_iso='2026-05-30T14:05:00+09:00',
+                              repr_text='x', price=100, seat_count=1)
+        s2 = self._open()
+        self.assertEqual(len(s2.list_pending_payments(123)), 1)
+
+    def test_remove_pending_payment(self):
+        s = self._open()
+        s.add_pending_payment(123, 'PNR1', deadline_iso='2026-05-30T14:05:00+09:00',
+                              repr_text='x', price=100, seat_count=1)
+        self.assertTrue(s.remove_pending_payment(123, 'PNR1'))
+        self.assertEqual(s.list_pending_payments(123), [])
+        self.assertFalse(s.remove_pending_payment(123, 'PNR1'))
+
+    def test_overwrite_same_rsv_id(self):
+        s = self._open()
+        s.add_pending_payment(123, 'PNR1', deadline_iso='t1', repr_text='old', price=1, seat_count=1)
+        s.add_pending_payment(123, 'PNR1', deadline_iso='t2', repr_text='new', price=2, seat_count=1)
+        payments = s.list_pending_payments(123)
+        self.assertEqual(len(payments), 1)
+        self.assertEqual(payments[0]['repr_text'], 'new')
+
+    def test_multiple_users_isolated(self):
+        s = self._open()
+        s.add_pending_payment(111, 'A', deadline_iso='t1', repr_text='x', price=1, seat_count=1)
+        s.add_pending_payment(222, 'B', deadline_iso='t2', repr_text='y', price=2, seat_count=1)
+        self.assertEqual(len(s.list_pending_payments(111)), 1)
+        self.assertEqual(len(s.list_pending_payments(222)), 1)
+        self.assertEqual(s.list_pending_payments(333), [])
+
+    def test_all_pending_payments_returns_chat_id_pairs(self):
+        s = self._open()
+        s.add_pending_payment(111, 'A', deadline_iso='t1', repr_text='x', price=1, seat_count=1)
+        s.add_pending_payment(111, 'B', deadline_iso='t2', repr_text='y', price=2, seat_count=1)
+        s.add_pending_payment(222, 'C', deadline_iso='t3', repr_text='z', price=3, seat_count=1)
+        all_p = s.all_pending_payments()
+        self.assertEqual(len(all_p), 3)
+        chat_ids = {chat_id for chat_id, _ in all_p}
+        self.assertEqual(chat_ids, {111, 222})
+        # chat_id 는 int 로 반환
+        for chat_id, _ in all_p:
+            self.assertIsInstance(chat_id, int)
+
+    def test_list_pending_payments_returns_copies(self):
+        s = self._open()
+        s.add_pending_payment(123, 'PNR1', deadline_iso='t', repr_text='x', price=1, seat_count=1)
+        payments = s.list_pending_payments(123)
+        payments[0]['rsv_id'] = 'TAMPERED'
+        # 내부 상태는 그대로
+        self.assertEqual(s.list_pending_payments(123)[0]['rsv_id'], 'PNR1')
+
 
 if __name__ == '__main__':
     unittest.main()
