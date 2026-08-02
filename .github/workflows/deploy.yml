@@ -1,0 +1,73 @@
+name: Deploy
+
+# 자동 배포를 push 에 걸지 않는다. 배포는 곧 봇 재시작이고, 재시작은 진행 중인
+# 헌팅을 끊는다. 세션은 핸드오프로 살아남지만 헌팅은 다시 걸어야 한다.
+on:
+  workflow_dispatch:      # Actions 탭에서 수동 실행
+  push:
+    tags: ['v*']          # 릴리스 태그
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 이미지 태그 결정
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME//\//-}-${GITHUB_SHA::7}"
+          echo "tags=${IMAGE,,}:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "latest=${IMAGE,,}:latest" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 서버가 x86_64 라 크로스 빌드가 필요 없다. 러너와 같은 아키텍처다.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ steps.meta.outputs.latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: SSH 로 배포
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.OCI_HOST }}
+          username: ${{ secrets.OCI_USER }}
+          key: ${{ secrets.OCI_SSH_KEY }}
+          script_stop: true
+          script: |
+            cd ~/korail-hunt
+            echo "BOT_IMAGE=${{ needs.build.outputs.image }}" > .image.env
+            docker compose --env-file .image.env pull
+            # down 이 아니라 up -d 로 교체한다. down 은 stop_grace_period 를
+            # 존중하지만, up -d 쪽이 새 이미지 pull 실패 시 기존 컨테이너를
+            # 살려두므로 더 안전하다.
+            docker compose --env-file .image.env up -d
+            docker compose ps
+            docker image prune -f

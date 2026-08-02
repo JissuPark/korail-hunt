@@ -1,0 +1,17 @@
+services:
+  bot:
+    image: ${BOT_IMAGE:-ghcr.io/jissupark/korail-hunt:latest}
+    container_name: korail-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # 승인된 사용자 목록·재시작 스냅샷·세션 핸드오프가 여기 쌓인다.
+      # 이 볼륨이 없으면 배포할 때마다 승인 목록이 날아간다.
+      - ./data:/app/data
+    # 종료 시 세션 핸드오프를 기록할 시간을 준다. 기본 10초로는 모자랄 수 있다.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

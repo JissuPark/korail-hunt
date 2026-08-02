@@ -1,0 +1,27 @@
+name: CI
+
+# 배포와 분리한다. 검증은 항상 자동으로, 배포는 의도적으로만.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: 의존성 설치
+        run: pip install -e ".[bot]"
+
+      - name: 단위 테스트
+        # 통합 테스트(test_integration.py)는 실제 코레일 자격증명이 필요해 건너뛴다.
+        run: python -m unittest test.test_unit test.test_bot -v
+
+      - name: Docker 이미지 빌드 검증
+        run: docker build -t korail-hunt:ci .
