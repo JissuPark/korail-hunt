@@ -38,6 +38,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 러너 기본 빌더는 'docker' 드라이버라 GHA 캐시 export 를 못 한다.
+      # docker-container 드라이버 빌더를 따로 만들어야 cache-to 가 동작한다.
+      - uses: docker/setup-buildx-action@v3
+
       # 서버가 x86_64 라 크로스 빌드가 필요 없다. 러너와 같은 아키텍처다.
       - uses: docker/build-push-action@v6
         with:
