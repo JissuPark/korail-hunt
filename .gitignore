@@ -22,6 +22,16 @@ test/korail_idpw.txt
 # 자격증명 (절대 커밋 금지)
 .env
 
+# 봇 런타임 상태 (chat_id, 헌팅 라벨, 승인된 사용자 목록)
+.bot_state.json
+.bot_users.json
+
+# 세션 핸드오프 (암호화되어 있지만 자격증명이 들어 있다 — 절대 커밋 금지)
+.bot_handoff.enc
+
+# 로컬 가상환경
+.venv/
+
 # Claude Code 로컬 상태
 .claude/
 
