@@ -15,6 +15,9 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
+          # 이 레포엔 requirements.txt/pyproject.toml 이 없다. 명시하지 않으면
+          # setup-python 이 해시할 파일을 못 찾아 실패한다.
+          cache-dependency-path: setup.py
 
       - name: 의존성 설치
         run: pip install -e ".[bot]"
