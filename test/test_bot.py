@@ -28,6 +28,7 @@ from bot import (
     authorized_chat_id,
     cb_access,
     cb_revoke,
+    check_config,
     cmd_login,
     cmd_logout,
     cmd_reservations,
@@ -44,6 +45,7 @@ from bot import (
     parse_date,
     parse_time,
     register_commands,
+    report_config,
     restore_sessions,
     save_state,
     snapshot_on_stop,
@@ -635,6 +637,80 @@ class RestartStateTests(unittest.IsolatedAsyncioTestCase):
         save_state(ctx)
         with open(self.path, encoding='utf-8') as f:
             self.assertEqual(json.load(f), {'111': ['서울→부산 06/01 10:00']})
+
+
+class ConfigCheckTests(unittest.IsolatedAsyncioTestCase):
+    # .env 는 레포에 없어 파이프라인이 챙기지 못한다. 기능이 에러 없이 꺼진 채
+    # 배포되던 문제를 기동 시 잡는다.
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        for patcher in (
+            patch.object(bot, 'STATE_FILE', os.path.join(self.dir, '.bot_state.json')),
+            patch.object(bot, 'USERS_FILE', os.path.join(self.dir, '.bot_users.json')),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _env(self, **overrides):
+        env = os.environ.copy()
+        for k in ('TELEGRAM_ADMIN_CHAT_IDS', 'SESSION_HANDOFF_KEY') + bot.PATH_ENV:
+            env.pop(k, None)
+        env.update(overrides)
+        return patch.dict(os.environ, env, clear=True)
+
+    def _healthy(self):
+        return self._env(TELEGRAM_ADMIN_CHAT_IDS='111', SESSION_HANDOFF_KEY='k')
+
+    def test_healthy_config_reports_nothing(self):
+        with self._healthy():
+            self.assertEqual(check_config(), [])
+
+    def test_missing_admin_is_reported(self):
+        with self._env(SESSION_HANDOFF_KEY='k'):
+            self.assertTrue(any('TELEGRAM_ADMIN_CHAT_IDS' in p for p in check_config()))
+
+    def test_missing_handoff_key_is_reported(self):
+        with self._env(TELEGRAM_ADMIN_CHAT_IDS='111'):
+            self.assertTrue(any('SESSION_HANDOFF_KEY' in p for p in check_config()))
+
+    def test_empty_path_override_is_reported(self):
+        # Docker 에서 컨테이너의 /app/data 설정을 덮어써 데이터가 사라지는 함정.
+        with self._env(TELEGRAM_ADMIN_CHAT_IDS='111', SESSION_HANDOFF_KEY='k',
+                       BOT_USERS_FILE=''):
+            self.assertTrue(any('BOT_USERS_FILE' in p for p in check_config()))
+
+    def test_set_path_override_is_fine(self):
+        with self._env(TELEGRAM_ADMIN_CHAT_IDS='111', SESSION_HANDOFF_KEY='k',
+                       BOT_USERS_FILE='/app/data/.bot_users.json'):
+            self.assertFalse(any('BOT_USERS_FILE' in p for p in check_config()))
+
+    def test_unwritable_state_dir_is_reported(self):
+        os.chmod(self.dir, 0o500)
+        self.addCleanup(os.chmod, self.dir, 0o700)
+        with self._healthy():
+            self.assertTrue(any('쓸 수 없다' in p for p in check_config()))
+
+    async def test_problems_are_sent_to_admin(self):
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+        with self._env(TELEGRAM_ADMIN_CHAT_IDS='111'):
+            await report_config(app)
+        body = app.bot.send_message.await_args.args[1]
+        self.assertIn('SESSION_HANDOFF_KEY', body)
+
+    async def test_nothing_sent_when_config_is_healthy(self):
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+        with self._healthy():
+            await report_config(app)
+        app.bot.send_message.assert_not_awaited()
+
+    async def test_send_failure_does_not_break_startup(self):
+        app = MagicMock()
+        app.bot.send_message = AsyncMock(side_effect=TelegramError('boom'))
+        with self._env(TELEGRAM_ADMIN_CHAT_IDS='111'):
+            await report_config(app)  # 예외가 새어나오면 안 된다
 
 
 class SessionHandoffTests(unittest.IsolatedAsyncioTestCase):

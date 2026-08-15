@@ -621,6 +621,7 @@ async def snapshot_on_stop(app: Application):
 async def on_startup(app: Application):
     """post_init 훅. 승인 목록 적재 → 세션 복원 → 재시작 안내 순서."""
     load_users(app)
+    await report_config(app)
     await register_commands(app)
     restored = restore_sessions(app)
     await notify_restart(app, restored)
@@ -1563,6 +1564,90 @@ async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target,
     finally:
         _chat_hunts(context, chat_id).pop(hunt_id, None)
         save_state(context)
+
+
+# ---------------------------------------------------------------------------
+# 설정 점검
+# ---------------------------------------------------------------------------
+# .env 는 레포에 없어서 배포 파이프라인이 챙겨주지 못한다. 코드에 새 환경변수를
+# 추가해도 서버 .env 는 그대로라, 기능이 에러 없이 꺼진 채로 도는 일이 생긴다.
+# 실제로 관리자 승인과 세션 핸드오프가 그렇게 며칠간 비활성 상태였다.
+# 여기서 기동 시 점검해 로그와 관리자 메시지로 알린다.
+
+# (환경변수, 없을 때 무슨 일이 벌어지는가)
+RECOMMENDED_ENV = [
+    ('TELEGRAM_ADMIN_CHAT_IDS',
+     '승인 절차가 동작하지 않는다. 새 사용자를 받을 수 없고 /users 도 못 쓴다.'),
+    ('SESSION_HANDOFF_KEY',
+     '재시작·재배포할 때마다 전원이 다시 /login 해야 한다.'),
+]
+
+# Docker 로 띄울 때 .env 에 빈 값으로 남아 있으면 이미지의 /app/data 설정을
+# 덮어써서, 볼륨 밖에 파일이 생기고 재배포마다 사라진다.
+PATH_ENV = ('BOT_STATE_FILE', 'BOT_USERS_FILE', 'BOT_HANDOFF_FILE')
+
+
+def _writable(path):
+    """해당 경로에 실제로 쓸 수 있는지 확인. 권한 문제를 기동 시 잡아낸다."""
+    directory = os.path.dirname(os.path.abspath(path)) or '.'
+    probe = os.path.join(directory, '.write_probe')
+    try:
+        with open(probe, 'w'):
+            pass
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def check_config():
+    """설정 문제 목록을 반환한다. 비어 있으면 정상."""
+    problems = []
+
+    for name, consequence in RECOMMENDED_ENV:
+        if not (os.environ.get(name) or '').strip():
+            problems.append(f"{name} 미설정 — {consequence}")
+
+    for name in PATH_ENV:
+        value = os.environ.get(name)
+        if value is not None and not value.strip():
+            problems.append(
+                f"{name} 이 빈 값이다 — .env 에서 지우거나 주석 처리하라. "
+                f"Docker 사용 시 컨테이너의 /app/data 설정을 덮어써서 "
+                f"재배포마다 데이터가 사라진다."
+            )
+
+    for label, path in (('상태 파일', STATE_FILE), ('승인 목록', USERS_FILE)):
+        if not _writable(path):
+            problems.append(
+                f"{label} 경로에 쓸 수 없다: {path} — 승인 목록과 재시작 안내가 "
+                f"저장되지 않는다. Docker 라면 호스트 data 디렉터리 소유권을 "
+                f"확인하라 (컨테이너는 uid 1000 으로 돈다)."
+            )
+
+    return problems
+
+
+async def report_config(app: Application):
+    """점검 결과를 로그와 관리자 채팅으로 알린다."""
+    problems = check_config()
+    if not problems:
+        logger.info("설정 점검 통과")
+        return
+
+    for p in problems:
+        logger.warning("설정 문제: %s", p)
+
+    admins = admin_chat_ids()
+    if not admins:
+        # 관리자 미설정이 문제 중 하나일 테니 로그로 끝낼 수밖에 없다.
+        return
+    text = "⚠️ <b>설정 점검</b>\n\n" + "\n\n".join(f"· {html.escape(p)}" for p in problems)
+    for admin_id in admins:
+        try:
+            await app.bot.send_message(admin_id, text, parse_mode=ParseMode.HTML)
+        except TelegramError as e:
+            logger.warning("설정 경고 전송 실패 (chat_id=%s): %s", admin_id, e)
 
 
 # ---------------------------------------------------------------------------
