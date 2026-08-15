@@ -15,24 +15,45 @@ from telegram.error import TelegramError
 
 import bot
 from bot import (
+    ASK_COUNT,
+    ASK_DATE,
+    KEY_ADULTS,
+    KEY_ARR,
+    KEY_DATE,
+    KEY_DEP,
     KEY_HUNT_TASKS,
     KEY_LOGIN_ID,
     KEY_PENDING,
+    KEY_SELECTED_TRAIN_IDX,
     KEY_SESSIONS,
+    KEY_TIME,
+    KEY_TRAINS,
     KEY_USERS,
     LOGIN_ID,
     LOGIN_PW,
+    PASSENGER_MAX,
+    PASSENGER_MIN,
     Session,
+    _count_keyboard,
+    _format_hunt_label,
     _help_for,
+    _hunt_loop,
+    _show_trains,
+    _train_hunt_loop,
     allowed_chat_ids,
     authorized_chat_id,
+    build_passengers,
     cb_access,
     cb_revoke,
     check_config,
+    clamp_passenger_count,
     cmd_login,
     cmd_logout,
     cmd_reservations,
     cmd_users,
+    conv_count,
+    conv_option,
+    describe_passengers,
     dump_sessions,
     format_reservation_success,
     get_session,
@@ -44,6 +65,7 @@ from bot import (
     notify_restart,
     parse_date,
     parse_time,
+    passengers_of,
     register_commands,
     report_config,
     restore_sessions,
@@ -51,6 +73,7 @@ from bot import (
     snapshot_on_stop,
     users,
 )
+from korail2 import AdultPassenger, ChildPassenger, ReserveOption, SeniorPassenger
 from korail2.korail2 import Reservation
 
 
@@ -820,6 +843,261 @@ class SessionHandoffTests(unittest.IsolatedAsyncioTestCase):
 
     def test_missing_file_restores_nothing(self):
         self.assertEqual(restore_sessions(_ctx()), frozenset())
+
+
+def _fake_train(train_no='001', dep_date='20260601', dep_time='100000', seat=True):
+    tr = MagicMock()
+    tr.train_no = train_no
+    tr.dep_date = dep_date
+    tr.dep_time = dep_time
+    tr.train_type_name = 'KTX'
+    tr.has_seat.return_value = seat
+    return tr
+
+
+def _callback_update(chat_id=111, data=''):
+    up = _update(chat_id)
+    up.callback_query.data = data
+    up.callback_query.answer = AsyncMock()
+    up.callback_query.edit_message_text = AsyncMock()
+    return up
+
+
+class PassengerConversionTests(unittest.TestCase):
+    # 인원수 → Passenger 객체. 라이브러리가 다인 예약을 지원하므로 한 번의
+    # 예약으로 여러 명을 같은 PNR 에 묶는다.
+
+    def test_single_adult(self):
+        psgrs = build_passengers(1)
+        self.assertEqual(len(psgrs), 1)
+        self.assertIsInstance(psgrs[0], AdultPassenger)
+        self.assertEqual(psgrs[0].count, 1)
+
+    def test_multiple_adults_are_one_grouped_passenger(self):
+        psgrs = build_passengers(4)
+        self.assertEqual([type(p) for p in psgrs], [AdultPassenger])
+        self.assertEqual(psgrs[0].count, 4)
+
+    def test_zero_is_raised_to_minimum(self):
+        self.assertEqual(build_passengers(0)[0].count, PASSENGER_MIN)
+
+    def test_over_max_is_capped(self):
+        self.assertEqual(build_passengers(PASSENGER_MAX + 5)[0].count, PASSENGER_MAX)
+
+    def test_negative_is_raised_to_minimum(self):
+        self.assertEqual(build_passengers(-3)[0].count, PASSENGER_MIN)
+
+
+class ClampPassengerCountTests(unittest.TestCase):
+    # 오래된 인라인 키보드를 다시 눌러 범위 밖 값이 들어와도 대화가 끊기면 안 된다.
+
+    def test_within_range_passthrough(self):
+        self.assertEqual(clamp_passenger_count(5), 5)
+
+    def test_boundaries_are_kept(self):
+        self.assertEqual(clamp_passenger_count(PASSENGER_MIN), PASSENGER_MIN)
+        self.assertEqual(clamp_passenger_count(PASSENGER_MAX), PASSENGER_MAX)
+
+    def test_below_min(self):
+        self.assertEqual(clamp_passenger_count(0), PASSENGER_MIN)
+
+    def test_above_max(self):
+        self.assertEqual(clamp_passenger_count(99), PASSENGER_MAX)
+
+    def test_numeric_string_from_callback_data(self):
+        self.assertEqual(clamp_passenger_count('3'), 3)
+
+    def test_garbage_falls_back_to_min(self):
+        self.assertEqual(clamp_passenger_count('셋'), PASSENGER_MIN)
+        self.assertEqual(clamp_passenger_count(None), PASSENGER_MIN)
+
+
+class DescribePassengersTests(unittest.TestCase):
+
+    def test_adults_only(self):
+        self.assertEqual(describe_passengers([AdultPassenger(2)]), '어른 2명')
+
+    def test_mixed_types_are_listed(self):
+        # UI 는 어른만 노출하지만, 확장 시 호출부를 고치지 않아도 되게 해둔다.
+        text = describe_passengers([AdultPassenger(2), ChildPassenger(1), SeniorPassenger(1)])
+        self.assertIn('어른 2명', text)
+        self.assertIn('어린이 1명', text)
+        self.assertIn('경로 1명', text)
+
+    def test_zero_counts_are_omitted(self):
+        self.assertEqual(describe_passengers([AdultPassenger(2), ChildPassenger(0)]), '어른 2명')
+
+    def test_empty_list_falls_back(self):
+        self.assertEqual(describe_passengers([]), f"어른 {PASSENGER_MIN}명")
+
+
+class PassengersOfTests(unittest.TestCase):
+
+    def test_reads_user_data(self):
+        ctx = _ctx()
+        ctx.user_data[KEY_ADULTS] = 3
+        self.assertEqual(passengers_of(ctx)[0].count, 3)
+
+    def test_missing_key_defaults_to_one(self):
+        # 인원 단계를 거치지 않은 흐름도 예약이 깨지면 안 된다.
+        self.assertEqual(passengers_of(_ctx())[0].count, PASSENGER_MIN)
+
+
+class CountKeyboardTests(unittest.TestCase):
+
+    def test_offers_every_allowed_count(self):
+        data = [b.callback_data for row in _count_keyboard().inline_keyboard for b in row]
+        self.assertIn(f"cnt:{PASSENGER_MIN}", data)
+        self.assertIn(f"cnt:{PASSENGER_MAX}", data)
+        self.assertNotIn(f"cnt:{PASSENGER_MAX + 1}", data)
+        self.assertIn('cancel', data)
+
+
+class ConvCountTests(unittest.IsolatedAsyncioTestCase):
+
+    async def test_selection_is_stored_and_moves_to_date(self):
+        ctx = _ctx()
+        up = _callback_update(data='cnt:4')
+        self.assertEqual(await conv_count(up, ctx), ASK_DATE)
+        self.assertEqual(ctx.user_data[KEY_ADULTS], 4)
+        self.assertIn('어른 4명', up.callback_query.edit_message_text.await_args[0][0])
+
+    async def test_out_of_range_callback_is_clamped(self):
+        ctx = _ctx()
+        await conv_count(_callback_update(data='cnt:99'), ctx)
+        self.assertEqual(ctx.user_data[KEY_ADULTS], PASSENGER_MAX)
+
+    async def test_cancel_ends_conversation(self):
+        ctx = _ctx()
+        result = await conv_count(_callback_update(data='cancel'), ctx)
+        self.assertNotEqual(result, ASK_DATE)
+        self.assertNotIn(KEY_ADULTS, ctx.user_data)
+
+    async def test_unknown_callback_stays_in_state(self):
+        self.assertEqual(await conv_count(_callback_update(data='nope'), _ctx()), ASK_COUNT)
+
+
+class HuntLabelTests(unittest.TestCase):
+    # 여러 헌팅이 동시에 도는데 인원이 안 보이면 어느 게 몇 명짜리인지 모른다.
+
+    def test_allday_label_shows_count(self):
+        label = _format_hunt_label('서울', '부산', '20260601', '100000',
+                                   passengers=build_passengers(3))
+        self.assertIn('서울→부산', label)
+        self.assertIn('어른 3명', label)
+
+    def test_train_label_shows_count(self):
+        label = _format_hunt_label('서울', '부산', '20260601', '100000',
+                                   train=_fake_train(), passengers=build_passengers(2))
+        self.assertIn('KTX 001', label)
+        self.assertIn('어른 2명', label)
+
+    def test_label_without_passengers_is_unchanged(self):
+        self.assertNotIn('명', _format_hunt_label('서울', '부산', '20260601', '100000'))
+
+
+class ReservationSuccessPassengerTests(unittest.TestCase):
+
+    def test_passenger_line_is_shown(self):
+        msg = format_reservation_success(_make_reservation(count=2), build_passengers(2))
+        self.assertIn('어른 2명', msg)
+
+    def test_omitted_when_not_given(self):
+        self.assertNotIn('<b>인원</b>', format_reservation_success(_make_reservation()))
+
+
+class PassengersReachKorailTests(unittest.IsolatedAsyncioTestCase):
+    """검색·예약·헌팅이 모두 같은 passengers 를 쓰는지 본다. 1명으로 검색하고
+    여러 명으로 예약하면 좌석이 있는 줄 알고 들어갔다가 매진으로 튕긴다."""
+
+    def setUp(self):
+        self.session = MagicMock()
+        self.session.korail = MagicMock()
+        for name in ('_session_or_end', '_ensure_login'):
+            p = patch.object(bot, name, AsyncMock(return_value=self.session))
+            p.start()
+            self.addCleanup(p.stop)
+        p = patch.object(bot, 'save_state', MagicMock())
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _ctx_with(self, adults):
+        ctx = _ctx()
+        ctx.user_data.update({
+            KEY_ADULTS: adults, KEY_DATE: '20260601', KEY_TIME: '100000',
+            KEY_DEP: '서울', KEY_ARR: '부산',
+        })
+        return ctx
+
+    @staticmethod
+    def _counts(call):
+        """_korail_call 한 번에 실려간 passengers 의 인원수."""
+        psgrs = call.kwargs.get('passengers')
+        if psgrs is None:
+            # reserve 는 위치 인자로 넘긴다: (session, fn, train, passengers, ...)
+            psgrs = call.args[3]
+        return sum(p.count for p in psgrs)
+
+    async def test_search_uses_selected_count(self):
+        ctx = self._ctx_with(3)
+        call = AsyncMock(return_value=[_fake_train()])
+        with patch.object(bot, '_korail_call', call):
+            await _show_trains(_callback_update(), ctx)
+        self.assertIs(call.await_args.args[1], self.session.korail.search_train)
+        self.assertEqual(self._counts(call.await_args), 3)
+
+    async def test_reserve_uses_same_count_as_search(self):
+        ctx = self._ctx_with(2)
+        train = _fake_train()
+        ctx.user_data[KEY_TRAINS] = [train]
+        ctx.user_data[KEY_SELECTED_TRAIN_IDX] = 0
+        call = AsyncMock(return_value=_make_reservation(count=2))
+        with patch.object(bot, '_korail_call', call):
+            await conv_option(_callback_update(data='opt:GENERAL_FIRST'), ctx)
+        self.assertIs(call.await_args.args[1], self.session.korail.reserve)
+        self.assertEqual(self._counts(call.await_args), 2)
+
+    async def test_reserve_success_message_shows_count(self):
+        ctx = self._ctx_with(2)
+        ctx.user_data[KEY_TRAINS] = [_fake_train()]
+        ctx.user_data[KEY_SELECTED_TRAIN_IDX] = 0
+        up = _callback_update(data='opt:GENERAL_FIRST')
+        with patch.object(bot, '_korail_call', AsyncMock(return_value=_make_reservation(count=2))):
+            await conv_option(up, ctx)
+        self.assertIn('어른 2명', up.effective_message.reply_text.await_args[0][0])
+
+    async def test_hunt_loop_searches_and_reserves_with_same_count(self):
+        psgrs = build_passengers(4)
+        ctx = self._ctx_with(4)
+        call = AsyncMock(side_effect=[[_fake_train()], _make_reservation(count=4)])
+        with patch.object(bot, '_korail_call', call):
+            await _hunt_loop(ctx, self.session, 111, 'h1', 'label',
+                             '서울', '부산', '20260601', '100000', psgrs, 0)
+
+        search, reserve = call.await_args_list
+        self.assertIs(search.args[1], self.session.korail.search_train_allday)
+        self.assertIs(reserve.args[1], self.session.korail.reserve)
+        self.assertEqual(self._counts(search), 4)
+        self.assertEqual(self._counts(reserve), 4)
+        self.assertIn('어른 4명', ctx.bot.send_message.await_args[0][1])
+
+    async def test_train_hunt_loop_searches_and_reserves_with_same_count(self):
+        psgrs = build_passengers(5)
+        ctx = self._ctx_with(5)
+        train = _fake_train(train_no='007')
+        target = (train.train_no, train.dep_date, train.dep_time)
+        call = AsyncMock(side_effect=[[train], _make_reservation(count=5)])
+        with patch.object(bot, '_korail_call', call):
+            await _train_hunt_loop(ctx, self.session, 111, 'h1', 'label', target,
+                                   '서울', '부산', '20260601', '100000', psgrs,
+                                   ReserveOption.GENERAL_FIRST, 0)
+
+        search, reserve = call.await_args_list
+        self.assertIs(search.args[1], self.session.korail.search_train)
+        self.assertIs(reserve.args[1], self.session.korail.reserve)
+        self.assertEqual(self._counts(search), 5)
+        self.assertEqual(self._counts(reserve), 5)
+        self.assertIn('어른 5명', ctx.bot.send_message.await_args[0][1])
 
 
 if __name__ == '__main__':

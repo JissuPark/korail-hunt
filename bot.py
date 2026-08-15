@@ -7,7 +7,7 @@ chat 별로 각자의 코레일 계정을 쓴다. 자격증명은 **메모리에
 
 흐름:
   /login    → 코레일 아이디 → 비밀번호 (입력 즉시 메시지 삭제) → 세션 생성
-  /reserve  → 출발일 → 출발시각 → 출발역 → 도착역 → 열차 선택 → 좌석옵션 → 예약
+  /reserve  → 인원 → 출발일 → 출발시각 → 출발역 → 도착역 → 열차 선택 → 좌석옵션 → 예약
   좌석이 없으면 [헌팅 시작] 버튼이 노출되고, polling 으로 자동 예약을 시도한다.
   /logout         → 세션 파기 (진행 중 헌팅도 중단)
   /hunt_stop      → 진행 중인 헌팅 중단
@@ -67,21 +67,26 @@ from telegram.ext import (
 )
 
 from korail2 import (
+    AdultPassenger,
+    ChildPassenger,
     Korail,
     KorailError,
     NoResultsError,
     PatchedKorail,
     ReserveOption,
+    SeniorPassenger,
     SoldOutError,
+    ToddlerPassenger,
 )
 
 logger = logging.getLogger(__name__)
 
 # ConversationHandler states — 두 대화가 독립이라 값이 겹치지 않게 분리한다.
-ASK_DATE, ASK_TIME, ASK_DEP, ASK_ARR, SELECT_TRAIN, SELECT_OPTION = range(6)
+ASK_COUNT, ASK_DATE, ASK_TIME, ASK_DEP, ASK_ARR, SELECT_TRAIN, SELECT_OPTION = range(7)
 LOGIN_ID, LOGIN_PW = range(100, 102)
 
 # context.user_data 키
+KEY_ADULTS = 'adults'
 KEY_DATE = 'date'
 KEY_TIME = 'time'
 KEY_DEP = 'dep'
@@ -156,14 +161,78 @@ def parse_time(text):
     raise ValueError(f"시각 형식을 인식할 수 없음: {text!r}. HHMM / HHMMSS / HH:MM 사용")
 
 
-def format_reservation_success(rsv):
+# ---------------------------------------------------------------------------
+# 인원
+# ---------------------------------------------------------------------------
+# 코레일은 한 번의 예약에 여러 명을 묶을 수 있고, 그래야 같은 예약번호(PNR)로
+# 좌석이 붙어서 배정되고 결제도 한 번에 끝난다. 1명씩 여러 번 예약하면 좌석이
+# 흩어지므로 passengers 리스트를 검색·예약 전 구간에 그대로 흘려보낸다.
+
+# 인원 하한/상한. 코레일 예매는 1회 9매까지라는 게 통설이고 공식 문서로 확인은
+# 못 했지만, 그 이상을 허용해봐야 예약 단계에서 코레일이 거절할 뿐이라 9로 막는다.
+PASSENGER_MIN = 1
+PASSENGER_MAX = 9
+
+# 표시 순서와 이름. 지금 UI 는 어른만 고르게 하지만, 여기에 항목이 늘어도
+# 라벨·메시지 쪽 호출부는 그대로 두면 되도록 리스트로 다룬다.
+PASSENGER_LABELS = (
+    (AdultPassenger, '어른'),
+    (SeniorPassenger, '경로'),
+    (ChildPassenger, '어린이'),
+    (ToddlerPassenger, '유아'),
+)
+
+
+def clamp_passenger_count(n):
+    """인원을 [PASSENGER_MIN, PASSENGER_MAX] 로 잘라낸다.
+
+    콜백 데이터는 사용자가 오래된 키보드를 다시 눌러 들어올 수도 있어서
+    범위를 신뢰할 수 없다. 예외로 대화를 끊는 대신 조용히 자른다.
+    """
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return PASSENGER_MIN
+    return max(PASSENGER_MIN, min(PASSENGER_MAX, n))
+
+
+def build_passengers(adults):
+    """인원수를 코레일 Passenger 리스트로 바꾼다.
+
+    라이브러리는 passengers=None 을 어른 1명으로 취급하지만, 검색과 예약에
+    같은 리스트를 명시적으로 넘겨야 '좌석 있음' 판정과 실제 예약 매수가
+    어긋나지 않는다.
+    """
+    return [AdultPassenger(clamp_passenger_count(adults))]
+
+
+def describe_passengers(passengers):
+    """'어른 2명' 같은 인원 문구. 헌팅이 여러 개 동시에 돌 때 라벨만 보고
+    어느 게 몇 명짜리인지 구분할 수 있어야 한다."""
+    parts = []
+    for cls, name in PASSENGER_LABELS:
+        count = sum(p.count for p in passengers if isinstance(p, cls))
+        if count > 0:
+            parts.append(f"{name} {count}명")
+    return ' '.join(parts) if parts else f"어른 {PASSENGER_MIN}명"
+
+
+def passengers_of(context):
+    """대화 상태에서 Passenger 리스트를 만든다. 인원 단계를 거치지 않은
+    흐름(구버전 대화가 남아 있는 경우 등)도 1명으로 안전하게 동작한다."""
+    return build_passengers(context.user_data.get(KEY_ADULTS, PASSENGER_MIN))
+
+
+def format_reservation_success(rsv, passengers=None):
     """예약 성공 메시지 (HTML)."""
     buy_dt = f"{rsv.buy_limit_date[:4]}-{rsv.buy_limit_date[4:6]}-{rsv.buy_limit_date[6:]}"
     buy_tm = f"{rsv.buy_limit_time[:2]}:{rsv.buy_limit_time[2:4]}"
+    psg_line = f"<b>인원</b>: {describe_passengers(passengers)}\n" if passengers else ""
     return (
         f"✅ <b>예약 성공</b>\n\n"
         f"{rsv!r}\n\n"
         f"<b>예약번호</b>: <code>{rsv.rsv_id}</code>\n"
+        f"{psg_line}"
         f"<b>구매기한</b>: {buy_dt} {buy_tm}\n"
         f"<b>금액</b>: {rsv.price:,}원 ({rsv.seat_no_count}석)\n\n"
         f"코레일톡 앱 → 승차권 → 결제대기에서 결제하라.\n"
@@ -703,7 +772,7 @@ HELP_TEXT = (
     "/start - 시작 / 도움말\n"
     "/login - 코레일 로그인 (제일 먼저)\n"
     "/logout - 로그아웃 (메모리에서 계정 삭제)\n"
-    "/reserve - 예약 시작 (일시 → 역 → 열차 → 옵션)\n"
+    "/reserve - 예약 시작 (인원 → 일시 → 역 → 열차 → 옵션)\n"
     "/reservations - 현재 예약\n"
     "/hunt_stop - 헌팅 중단\n"
     "/cancel - 진행 취소\n"
@@ -1087,6 +1156,19 @@ def _station_keyboard(prefix):
     return InlineKeyboardMarkup(rows)
 
 
+def _count_keyboard():
+    rows, row = [], []
+    for n in range(PASSENGER_MIN, PASSENGER_MAX + 1):
+        row.append(InlineKeyboardButton(f"{n}명", callback_data=f"cnt:{n}"))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("취소", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
 def _date_keyboard(today=None):
     if today is None:
         today = date.today()
@@ -1119,7 +1201,26 @@ def _time_keyboard():
 @with_session
 async def conv_start(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session):
     context.user_data.clear()
-    await update.message.reply_text("출발일 선택:", reply_markup=_date_keyboard())
+    # 인원을 제일 먼저 받는다. 이후 검색이 곧바로 그 인원 기준으로 좌석을
+    # 따져야 해서, 날짜·역보다 앞에 두는 게 흐름이 단순하다.
+    await update.message.reply_text("인원 선택 (어른):", reply_markup=_count_keyboard())
+    return ASK_COUNT
+
+
+async def conv_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "cancel":
+        await query.edit_message_text("취소됨.")
+        return ConversationHandler.END
+    if not query.data.startswith("cnt:"):
+        return ASK_COUNT
+    adults = clamp_passenger_count(query.data.split(":", 1)[1])
+    context.user_data[KEY_ADULTS] = adults
+    await query.edit_message_text(
+        f"인원: {describe_passengers(build_passengers(adults))}\n\n출발일 선택:",
+        reply_markup=_date_keyboard(),
+    )
     return ASK_DATE
 
 
@@ -1218,11 +1319,15 @@ async def _show_trains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arr = context.user_data[KEY_ARR]
     d = context.user_data[KEY_DATE]
     t = context.user_data[KEY_TIME]
+    # 검색도 인원 기준이어야 한다. 1명으로 검색하고 여러 명으로 예약하면
+    # 좌석이 있는 줄 알고 들어갔다가 예약 단계에서 매진으로 튕긴다.
+    passengers = passengers_of(context)
 
     await _ensure_login(session)
     try:
         trains = await _korail_call(
-            session, korail.search_train, dep, arr, d, t, include_no_seats=True,
+            session, korail.search_train, dep, arr, d, t,
+            passengers=passengers, include_no_seats=True,
         )
     except NoResultsError:
         trains = []
@@ -1314,6 +1419,7 @@ async def conv_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
     korail: Korail = session.korail
     train_idx = context.user_data[KEY_SELECTED_TRAIN_IDX]
     train = context.user_data[KEY_TRAINS][train_idx]
+    passengers = passengers_of(context)
 
     # 매진 열차면 예약 시도 건너뛰고 즉시 해당 열차 헌팅 시작.
     if not train.has_seat():
@@ -1324,7 +1430,7 @@ async def conv_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"예약 중... {train!r}")
     await _ensure_login(session)
     try:
-        rsv = await _korail_call(session, korail.reserve, train, None, option, False)
+        rsv = await _korail_call(session, korail.reserve, train, passengers, option, False)
     except SoldOutError:
         # 검색 후 예약 직전에 매진 — 같은 열차로 헌팅 fallback.
         await update.effective_message.reply_text(
@@ -1343,7 +1449,7 @@ async def conv_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await update.effective_message.reply_text(
-        format_reservation_success(rsv),
+        format_reservation_success(rsv, passengers),
         parse_mode=ParseMode.HTML,
     )
     return ConversationHandler.END
@@ -1373,13 +1479,15 @@ def _next_hunt_id(chat_hunts):
     return f"h{n}"
 
 
-def _format_hunt_label(dep, arr, d, t, train=None):
+def _format_hunt_label(dep, arr, d, t, train=None, passengers=None):
     date_str = f"{d[4:6]}/{d[6:]}"
+    # 인원이 다른 헌팅을 같은 구간에 여러 개 걸 수 있어서 라벨에 인원을 붙인다.
+    psg = f" ({describe_passengers(passengers)})" if passengers else ""
     if train is not None:
         time_str = f"{train.dep_time[:2]}:{train.dep_time[2:4]}"
-        return f"[{train.train_type_name} {train.train_no}] {dep}→{arr} {date_str} {time_str}"
+        return f"[{train.train_type_name} {train.train_no}] {dep}→{arr} {date_str} {time_str}{psg}"
     time_str = f"{t[:2]}:{t[2:4]}"
-    return f"전체 {dep}→{arr} {date_str} {time_str}~"
+    return f"전체 {dep}→{arr} {date_str} {time_str}~{psg}"
 
 
 def _active_hunts(context, chat_id):
@@ -1397,23 +1505,28 @@ async def _start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arr = context.user_data[KEY_ARR]
     d = context.user_data[KEY_DATE]
     t = context.user_data[KEY_TIME]
+    passengers = passengers_of(context)
     interval = float(os.environ.get('TELEGRAM_HUNT_INTERVAL', '3'))
 
     hunt_id = _next_hunt_id(chat_hunts)
-    label = _format_hunt_label(dep, arr, d, t, train=None)
+    label = _format_hunt_label(dep, arr, d, t, train=None, passengers=passengers)
 
     await update.effective_message.reply_text(
         f"[{hunt_id}] {label}\n전체 헌팅 시작 (간격 {interval}s). /hunt_stop 으로 중단."
     )
 
+    # 인원은 헌팅이 도는 내내 고정이라 루프 시작 시점의 값을 넘긴다.
+    # user_data 를 루프 안에서 다시 읽으면 다음 /reserve 가 값을 덮어쓴다.
     task = asyncio.create_task(
-        _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t, interval)
+        _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t,
+                   passengers, interval)
     )
     chat_hunts[hunt_id] = {'task': task, 'label': label}
     save_state(context)
 
 
-async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t, interval):
+async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t,
+                     passengers, interval):
     korail: Korail = session.korail
     bot = context.bot
     attempts = 0
@@ -1424,6 +1537,7 @@ async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t, 
                 await _ensure_login(session)
                 trains = await _korail_call(
                     session, korail.search_train_allday, dep, arr, d, t,
+                    passengers=passengers,
                 )
             except NoResultsError:
                 await asyncio.sleep(interval)
@@ -1440,7 +1554,8 @@ async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t, 
 
             try:
                 rsv = await _korail_call(
-                    session, korail.reserve, trains[0], None, ReserveOption.GENERAL_FIRST, False,
+                    session, korail.reserve, trains[0], passengers,
+                    ReserveOption.GENERAL_FIRST, False,
                 )
             except SoldOutError:
                 await asyncio.sleep(interval)
@@ -1458,7 +1573,7 @@ async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t, 
 
             await bot.send_message(
                 chat_id,
-                f"🎉 [{hunt_id}] {label}\n헌팅 성공 ({attempts}회 시도)\n\n{format_reservation_success(rsv)}",
+                f"🎉 [{hunt_id}] {label}\n헌팅 성공 ({attempts}회 시도)\n\n{format_reservation_success(rsv, passengers)}",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -1484,10 +1599,11 @@ async def _start_train_hunt(update, context, train_idx, option):
     arr = context.user_data[KEY_ARR]
     d = context.user_data[KEY_DATE]
     t = context.user_data[KEY_TIME]
+    passengers = passengers_of(context)
     interval = float(os.environ.get('TELEGRAM_HUNT_INTERVAL', '3'))
 
     hunt_id = _next_hunt_id(chat_hunts)
-    label = _format_hunt_label(dep, arr, d, t, train=train)
+    label = _format_hunt_label(dep, arr, d, t, train=train, passengers=passengers)
 
     await update.effective_message.reply_text(
         f"[{hunt_id}] {label}\n옵션: {option}, 간격 {interval}s. /hunt_stop 으로 중단."
@@ -1495,14 +1611,14 @@ async def _start_train_hunt(update, context, train_idx, option):
 
     task = asyncio.create_task(
         _train_hunt_loop(context, session, chat_id, hunt_id, label, target,
-                         dep, arr, d, t, option, interval)
+                         dep, arr, d, t, passengers, option, interval)
     )
     chat_hunts[hunt_id] = {'task': task, 'label': label}
     save_state(context)
 
 
 async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target,
-                           dep, arr, d, t, option, interval):
+                           dep, arr, d, t, passengers, option, interval):
     korail: Korail = session.korail
     bot = context.bot
     attempts = 0
@@ -1512,7 +1628,8 @@ async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target,
             try:
                 await _ensure_login(session)
                 trains = await _korail_call(
-                    session, korail.search_train, dep, arr, d, t, include_no_seats=True,
+                    session, korail.search_train, dep, arr, d, t,
+                    passengers=passengers, include_no_seats=True,
                 )
             except NoResultsError:
                 await asyncio.sleep(interval)
@@ -1537,7 +1654,7 @@ async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target,
                 continue
 
             try:
-                rsv = await _korail_call(session, korail.reserve, match, None, option, False)
+                rsv = await _korail_call(session, korail.reserve, match, passengers, option, False)
             except SoldOutError:
                 await asyncio.sleep(interval)
                 continue
@@ -1554,7 +1671,7 @@ async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target,
 
             await bot.send_message(
                 chat_id,
-                f"🎉 [{hunt_id}] {label}\n열차 헌팅 성공 ({attempts}회 시도)\n\n{format_reservation_success(rsv)}",
+                f"🎉 [{hunt_id}] {label}\n열차 헌팅 성공 ({attempts}회 시도)\n\n{format_reservation_success(rsv, passengers)}",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -1702,6 +1819,7 @@ def main():
         allow_reentry=True,
         entry_points=[CommandHandler('reserve', conv_start)],
         states={
+            ASK_COUNT: [CallbackQueryHandler(conv_count, pattern=r"^(cnt:|cancel$)")],
             ASK_DATE: [CallbackQueryHandler(conv_date, pattern=r"^(date:|cancel$)")],
             ASK_TIME: [CallbackQueryHandler(conv_time, pattern=r"^(time:|cancel$)")],
             ASK_DEP: [
