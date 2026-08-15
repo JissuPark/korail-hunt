@@ -4,6 +4,7 @@ bot.py 단위 테스트 — 네트워크/봇 연결 없이 파서와 포매터�
 Conversation handler 자체는 python-telegram-bot 의 통합 환경이 필요해 여기서
 다루지 않는다. 직접 봇을 띄워 수동 검증하라.
 """
+import asyncio
 import json
 import os
 import tempfile
@@ -34,10 +35,13 @@ from bot import (
     PASSENGER_MAX,
     PASSENGER_MIN,
     Session,
+    _chat_hunts,
     _count_keyboard,
     _format_hunt_label,
     _help_for,
     _hunt_loop,
+    _hunt_spec,
+    _load_hunt_spec,
     _show_trains,
     _train_hunt_loop,
     allowed_chat_ids,
@@ -68,6 +72,7 @@ from bot import (
     passengers_of,
     register_commands,
     report_config,
+    restore_hunts,
     restore_sessions,
     save_state,
     snapshot_on_stop,
@@ -647,6 +652,79 @@ class RestartStateTests(unittest.IsolatedAsyncioTestCase):
         await notify_restart(app)
         app.bot.send_message.assert_not_awaited()
 
+    def _write_state(self, snapshot):
+        with open(self.path, 'w', encoding='utf-8') as f:
+            json.dump(snapshot, f, ensure_ascii=False)
+
+    def _sent(self, app):
+        return {c.args[0]: c.args[1] for c in app.bot.send_message.await_args_list}
+
+    async def test_resumed_hunt_user_is_told_it_continues_not_to_relogin(self):
+        # 헌팅까지 이어졌으면 다시 걸라는 안내는 틀린 말이 된다.
+        self._write_state({'111': ['서울→부산 06/01 10:00']})
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+        with patch.dict(os.environ, {'TELEGRAM_ADMIN_CHAT_IDS': ''}):
+            await notify_restart(
+                app,
+                restored=frozenset({111}),
+                resumed={111: ['서울→부산 06/01 10:00']},
+            )
+
+        body = self._sent(app)[111]
+        self.assertIn('이어서 실행 중', body)
+        self.assertIn('서울→부산 06/01 10:00', body)
+        self.assertNotIn('/login', body)
+        self.assertNotIn('/reserve', body)
+
+    async def test_fully_restored_user_without_hunts_is_not_bothered(self):
+        # 세션만 복원되고 할 일이 없으면 재배포는 사용자에게 비사건이다.
+        self._write_state({'111': [], '222': []})
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+        with patch.dict(os.environ, {'TELEGRAM_ADMIN_CHAT_IDS': ''}):
+            await notify_restart(app, restored=frozenset({111, 222}))
+        app.bot.send_message.assert_not_awaited()
+
+    async def test_hunt_that_could_not_resume_is_reported_to_its_owner(self):
+        # 세션은 살았지만 헌팅이 못 이어진 경우엔 다시 걸라고 알려야 한다.
+        self._write_state({'111': ['이어진 헌팅', '못 이어진 헌팅']})
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+        with patch.dict(os.environ, {'TELEGRAM_ADMIN_CHAT_IDS': ''}):
+            await notify_restart(
+                app, restored=frozenset({111}), resumed={111: ['이어진 헌팅']},
+            )
+
+        body = self._sent(app)[111]
+        self.assertIn('이어가지 못한 헌팅', body)
+        self.assertIn('못 이어진 헌팅', body)
+        self.assertIn('/reserve', body)
+        self.assertNotIn('/login', body)
+
+    async def test_admin_gets_restart_summary(self):
+        self._write_state({'111': ['서울→부산'], '222': []})
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+        with patch.dict(os.environ, {'TELEGRAM_ADMIN_CHAT_IDS': '999'}):
+            await notify_restart(
+                app, restored=frozenset({111}), resumed={111: ['서울→부산']},
+            )
+
+        summary = self._sent(app)[999]
+        self.assertIn('재시작', summary)
+        self.assertIn('세션 1개', summary)
+        self.assertIn('헌팅 1개', summary)
+        self.assertIn('1명 재로그인 필요', summary)  # 222 는 복원되지 않았다
+
+    async def test_admin_summary_is_skipped_when_nothing_happened(self):
+        # 최초 기동처럼 직전 흔적이 없으면 보고할 것도 없다.
+        app = MagicMock()
+        app.bot.send_message = AsyncMock()
+        with patch.dict(os.environ, {'TELEGRAM_ADMIN_CHAT_IDS': '999'}):
+            await notify_restart(app)
+        app.bot.send_message.assert_not_awaited()
+
     async def test_shutdown_snapshot_survives_hunt_cleanup(self):
         # 정상 종료 시 헌팅 task 의 finally 가 스냅샷을 지우면 안 된다.
         ctx = _ctx()
@@ -1098,6 +1176,266 @@ class PassengersReachKorailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._counts(search), 5)
         self.assertEqual(self._counts(reserve), 5)
         self.assertIn('어른 5명', ctx.bot.send_message.await_args[0][1])
+class HuntPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    """재시작 때 헌팅이 조건 그대로 되살아나는지 검증한다.
+
+    실제 코레일 루프 대신 인자만 기록하는 스텁을 끼워, 어느 종류의 헌팅이 어떤
+    조건으로 다시 떴는지만 본다.
+    """
+    CHAT = 111
+    OTHER = 222
+    KEY = 'test-handoff-key'
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix='.enc')
+        os.close(fd)
+        os.remove(self.path)
+        self.dir = tempfile.mkdtemp()
+        for patcher in (
+            patch.object(bot, 'HANDOFF_FILE', self.path),
+            patch.object(bot, 'HANDOFF_TTL', 300),
+            patch.object(bot, 'STATE_FILE', os.path.join(self.dir, '.bot_state.json')),
+            patch.dict(os.environ, {'SESSION_HANDOFF_KEY': self.KEY}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(lambda: os.path.exists(self.path) and os.remove(self.path))
+
+        self.started = []
+        for name in ('_hunt_loop', '_train_hunt_loop'):
+            patcher = patch.object(bot, name, self._stub(name))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _stub(self, name):
+        async def _noop():
+            return None
+
+        def loop(*args):
+            self.started.append((name, args))
+            return _noop()
+        return loop
+
+    def _all_spec(self, label='전체 서울→부산 06/01 10:00'):
+        # 인원을 1명이 아닌 값으로 둬야 인원이 실제로 실려 가는지 검증된다.
+        return _hunt_spec(label, '서울', '부산', '20260601', '100000', 3.0, adults=3)
+
+    def _train_spec(self, label='[KTX 101] 서울→부산 06/01 10:00', option=None):
+        return _hunt_spec(
+            label, '서울', '부산', '20260601', '100000', 2.5,
+            target=('101', '20260601', '100000'),
+            option=option or bot.ReserveOption.SPECIAL_ONLY,
+            adults=3,
+        )
+
+    def _live_app(self, *hunts, **kwargs):
+        """세션 1개와 주어진 헌팅이 돌고 있는 종료 직전 상태."""
+        app = _ctx()
+        korail = MagicMock()
+        korail.korail_id, korail.korail_pw = '12345678', 'hunter2'
+        korail._key, korail._idx = 'KEY123', 'IDX9'
+        korail.membership_number, korail.name, korail.email = '12345678', '홍길동', 'a@b.c'
+        korail.logined = True
+        korail._session.cookies = []
+        app.bot_data[KEY_SESSIONS] = {self.CHAT: Session(korail)}
+        app.bot_data[KEY_HUNT_TASKS] = {
+            self.CHAT: {
+                hid: {'task': _done_task(), 'label': spec['label'], 'spec': spec}
+                for hid, spec in hunts
+            },
+        }
+        return app
+
+    async def _restart(self, app):
+        """정상 종료 → 재기동을 흉내내고 (새 app, restored, resumed) 를 돌려준다."""
+        dump_sessions(app)
+        fresh = _ctx()
+        with patch.object(bot, 'PatchedKorail'):
+            restored = restore_sessions(fresh)
+            resumed = await restore_hunts(fresh)
+        await asyncio.sleep(0)  # 스텁 task 를 마저 돌린다
+        return fresh, restored, resumed
+
+    async def test_all_train_hunt_round_trip(self):
+        _, _, resumed = await self._restart(self._live_app(('h1', self._all_spec())))
+
+        self.assertEqual(resumed, {self.CHAT: ['전체 서울→부산 06/01 10:00']})
+        name, args = self.started[0]
+        self.assertEqual(name, '_hunt_loop')
+        # (context, session, chat_id, hunt_id, label, dep, arr, d, t, passengers, interval)
+        self.assertEqual(
+            args[2:9],
+            (self.CHAT, 'h1', '전체 서울→부산 06/01 10:00',
+             '서울', '부산', '20260601', '100000'),
+        )
+        # 인원이 살아 넘어와야 한다. 빠지면 4명짜리 헌팅이 조용히 1명이 된다.
+        self.assertEqual(describe_passengers(args[9]), '어른 3명')
+        self.assertEqual(args[10], 3.0)
+
+    async def test_train_hunt_round_trip_keeps_target_tuple_and_option(self):
+        _, _, resumed = await self._restart(self._live_app(('h1', self._train_spec())))
+
+        self.assertEqual(resumed, {self.CHAT: ['[KTX 101] 서울→부산 06/01 10:00']})
+        name, args = self.started[0]
+        self.assertEqual(name, '_train_hunt_loop')
+        # (context, session, chat_id, hunt_id, label, target, dep, arr, d, t,
+        #  passengers, option, interval)
+        # target 은 JSON 을 거치며 리스트가 되므로 튜플로 되돌아와야 열차 대조가 맞는다.
+        self.assertEqual(args[5], ('101', '20260601', '100000'))
+        self.assertEqual(describe_passengers(args[10]), '어른 3명')
+        self.assertEqual(args[11], 'SPECIAL_ONLY')
+        self.assertEqual(args[12], 2.5)
+
+    async def test_hunt_ids_are_preserved_so_hunt_stop_still_works(self):
+        app = self._live_app(('h2', self._all_spec('A')), ('h5', self._train_spec('B')))
+        fresh, _, _ = await self._restart(app)
+
+        self.assertEqual(sorted(_chat_hunts(fresh, self.CHAT)), ['h2', 'h5'])
+        self.assertEqual([args[3] for _, args in self.started], ['h2', 'h5'])
+
+    async def test_hunt_of_chat_without_session_is_not_resumed(self):
+        # 세션 없이는 코레일 호출이 불가능하다.
+        app = self._live_app(('h1', self._all_spec()))
+        app.bot_data[KEY_HUNT_TASKS][self.OTHER] = {
+            'h1': {'task': _done_task(), 'label': 'C', 'spec': self._all_spec('C')},
+        }
+        _, _, resumed = await self._restart(app)
+
+        self.assertEqual(set(resumed), {self.CHAT})
+        self.assertEqual(len(self.started), 1)
+
+    async def test_one_broken_hunt_does_not_take_down_the_rest(self):
+        broken = self._train_spec('깨진 헌팅')
+        broken['option'] = 'NOT_A_REAL_OPTION'
+        app = self._live_app(('h1', broken), ('h2', self._all_spec('멀쩡한 헌팅')))
+        _, _, resumed = await self._restart(app)
+
+        self.assertEqual(resumed, {self.CHAT: ['멀쩡한 헌팅']})
+        self.assertEqual([args[3] for _, args in self.started], ['h2'])
+
+    async def test_passenger_count_survives_the_handoff(self):
+        # 인원 기능이 붙기 전이라 루프로 넘기지는 않지만, 조건은 실려 와야 한다.
+        spec = self._all_spec()
+        spec['adults'] = 4
+        fresh, _, _ = await self._restart(self._live_app(('h1', spec)))
+        self.assertEqual(_chat_hunts(fresh, self.CHAT)['h1']['spec']['adults'], 4)
+
+    async def test_finished_hunt_is_not_carried_over(self):
+        app = self._live_app(('h1', self._all_spec()))
+        app.bot_data[KEY_HUNT_TASKS][self.CHAT]['h1']['task'] = MagicMock(done=lambda: True)
+        _, _, resumed = await self._restart(app)
+        self.assertEqual(resumed, {})
+
+    async def test_hunt_conditions_are_not_stored_in_plaintext(self):
+        # 조건도 자격증명과 같은 암호화 페이로드 안에만 존재해야 한다.
+        dump_sessions(self._live_app(('h1', self._all_spec())))
+        with open(self.path, 'rb') as f:
+            blob = f.read()
+        self.assertNotIn('서울'.encode('utf-8'), blob)
+        self.assertNotIn(b'20260601', blob)
+
+    async def test_expired_handoff_resumes_nothing(self):
+        dump_sessions(self._live_app(('h1', self._all_spec())))
+        fresh = _ctx()
+        with patch.object(bot, 'HANDOFF_TTL', -1), patch.object(bot, 'PatchedKorail'):
+            restore_sessions(fresh)
+            resumed = await restore_hunts(fresh)
+        self.assertEqual(resumed, {})
+        self.assertEqual(self.started, [])
+
+    async def test_disabled_handoff_resumes_nothing(self):
+        with patch.dict(os.environ, {'SESSION_HANDOFF_KEY': ''}):
+            dump_sessions(self._live_app(('h1', self._all_spec())))
+            fresh = _ctx()
+            restore_sessions(fresh)
+            resumed = await restore_hunts(fresh)
+        self.assertEqual(resumed, {})
+        self.assertEqual(self.started, [])
+
+    async def test_hunt_started_before_this_feature_is_skipped(self):
+        # spec 없이 기록된 헌팅은 조건을 알 수 없어 되살릴 수 없다.
+        app = self._live_app()
+        app.bot_data[KEY_HUNT_TASKS][self.CHAT]['h1'] = {
+            'task': _done_task(), 'label': '구버전 헌팅',
+        }
+        _, _, resumed = await self._restart(app)
+        self.assertEqual(resumed, {})
+
+
+class HuntSpecTests(unittest.TestCase):
+    """직렬화 포맷 자체의 방어선. 이상한 값이 코레일 호출까지 흘러가면 안 된다."""
+
+    def _raw(self, **overrides):
+        spec = _hunt_spec(
+            'L', '서울', '부산', '20260601', '100000', 3.0,
+            target=('101', '20260601', '100000'),
+            option=bot.ReserveOption.GENERAL_ONLY,
+        )
+        spec['hunt_id'] = 'h1'
+        spec.update(overrides)
+        return spec
+
+    def test_round_trip_through_json(self):
+        hunt_id, spec = _load_hunt_spec(json.loads(json.dumps(self._raw())))
+        self.assertEqual(hunt_id, 'h1')
+        self.assertEqual(spec['kind'], bot.HUNT_TRAIN)
+        self.assertEqual(spec['target'], ('101', '20260601', '100000'))
+        self.assertEqual(spec['option'], 'GENERAL_ONLY')
+        self.assertEqual(spec['interval'], 3.0)
+
+    def test_all_hunt_has_no_target_or_option(self):
+        raw = _hunt_spec('L', '서울', '부산', '20260601', '100000', 3.0)
+        raw['hunt_id'] = 'h1'
+        _, spec = _load_hunt_spec(raw)
+        self.assertEqual(spec['kind'], bot.HUNT_ALL)
+        self.assertNotIn('target', spec)
+        self.assertNotIn('option', spec)
+
+    def test_every_reserve_option_survives(self):
+        # ReserveOption 은 enum 이 아니라 문자열 상수라 값이 곧 이름이다.
+        for name in ('GENERAL_FIRST', 'GENERAL_ONLY', 'SPECIAL_FIRST', 'SPECIAL_ONLY'):
+            _, spec = _load_hunt_spec(self._raw(option=getattr(bot.ReserveOption, name)))
+            self.assertEqual(spec['option'], name)
+
+    def test_passenger_count_round_trips(self):
+        # 인원을 잃으면 4명짜리 헌팅이 재시작 뒤 조용히 1명이 된다.
+        raw = self._raw()
+        raw['adults'] = 4
+        _, spec = _load_hunt_spec(json.loads(json.dumps(raw)))
+        self.assertEqual(spec['adults'], 4)
+
+    def test_missing_passenger_count_falls_back_to_one(self):
+        # 인원 필드가 없던 시절에 기록된 레코드도 받아야 한다.
+        raw = self._raw()
+        del raw['adults']
+        _, spec = _load_hunt_spec(raw)
+        self.assertEqual(spec['adults'], 1)
+
+    def test_broken_passenger_count_falls_back_to_one(self):
+        _, spec = _load_hunt_spec(self._raw(adults='없음'))
+        self.assertEqual(spec['adults'], 1)
+
+    def test_passenger_count_is_clamped_to_bookable_range(self):
+        self.assertEqual(_load_hunt_spec(self._raw(adults=999))[1]['adults'], 9)
+        self.assertEqual(_load_hunt_spec(self._raw(adults=0))[1]['adults'], 1)
+
+    def test_unknown_option_is_rejected(self):
+        with self.assertRaises(ValueError):
+            _load_hunt_spec(self._raw(option='DROP_TABLE'))
+
+    def test_unknown_kind_is_rejected(self):
+        with self.assertRaises(ValueError):
+            _load_hunt_spec(self._raw(kind='weird'))
+
+    def test_malformed_target_is_rejected(self):
+        with self.assertRaises(ValueError):
+            _load_hunt_spec(self._raw(target=['101']))
+
+    def test_missing_field_is_rejected(self):
+        raw = self._raw()
+        del raw['dep']
+        with self.assertRaises(KeyError):
+            _load_hunt_spec(raw)
 
 
 if __name__ == '__main__':

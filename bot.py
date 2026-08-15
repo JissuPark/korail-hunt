@@ -97,7 +97,8 @@ KEY_LOGIN_ID = 'login_id'
 
 # context.bot_data 키
 KEY_SESSIONS = 'sessions'  # chat_id -> Session (메모리 전용, 절대 영속화 금지)
-KEY_HUNT_TASKS = 'hunt_tasks'  # chat_id -> {hunt_id: {'task', 'label'}}
+KEY_HUNT_TASKS = 'hunt_tasks'  # chat_id -> {hunt_id: {'task', 'label', 'spec'}}
+KEY_RESUME_HUNTS = 'resume_hunts'  # 핸드오프에서 읽은 헌팅 조건. restore_hunts 가 소비한다.
 KEY_SHUTDOWN = 'shutdown'  # 종료 스냅샷 확정 후 True
 KEY_USERS = 'users'  # {'approved': {chat_id: info}, 'denied': {chat_id: info}}
 KEY_PENDING = 'pending'  # chat_id -> info. 승인 대기열 (메모리 전용)
@@ -503,6 +504,10 @@ def save_users(context):
 # 암호화해 디스크에 쓰고, 기동 직후 복원한 뒤 파일을 즉시 지운다. 디스크 체류
 # 시간은 재시작에 걸리는 수 초뿐이다.
 #
+# 진행 중이던 헌팅 조건도 같은 페이로드에 실어 보낸다. 조건 자체에는 자격증명이
+# 없지만, 헌팅을 되살리려면 어차피 세션이 있어야 해서 둘의 수명이 같다. 별도
+# 평문 파일로 빼면 "누가 언제 어디로 가려 했는지"가 디스크에 남으므로 같이 묶는다.
+#
 # 안전 장치:
 #   - SESSION_HANDOFF_KEY 가 없으면 기능 자체가 꺼진다 (명시적 옵트인)
 #   - AES-GCM 으로 암호화·인증하므로 변조된 파일은 거부된다
@@ -583,6 +588,7 @@ def dump_sessions(app):
     payload = {
         'ts': time.time(),
         'sessions': {str(cid): _dump_session(s) for cid, s in live.items()},
+        'hunts': _dump_hunts(app),
     }
     blob = _encrypt(json.dumps(payload).encode('utf-8'), key)
     try:
@@ -593,7 +599,10 @@ def dump_sessions(app):
     except OSError as e:
         logger.warning("세션 핸드오프 기록 실패: %s", e)
         return False
-    logger.info("세션 %d개 핸드오프 기록", len(live))
+    logger.info(
+        "세션 %d개, 헌팅 %d개 핸드오프 기록",
+        len(live), sum(len(v) for v in payload['hunts'].values()),
+    )
     return True
 
 
@@ -648,6 +657,9 @@ def restore_sessions(app):
             continue
         restored.add(chat_id)
     logger.info("세션 %d개 복원 (경과 %.0f초)", len(restored), age)
+    # 헌팅 재개는 task 생성이라 실행 중인 루프가 필요하다. 여기서는 조건만 넘겨두고
+    # restore_hunts() 가 소비한다. 이 함수는 동기 호출도 되어야 해서 분리했다.
+    app.bot_data[KEY_RESUME_HUNTS] = payload.get('hunts') or {}
     return frozenset(restored)
 
 
@@ -688,60 +700,124 @@ async def snapshot_on_stop(app: Application):
 
 
 async def on_startup(app: Application):
-    """post_init 훅. 승인 목록 적재 → 세션 복원 → 재시작 안내 순서."""
+    """post_init 훅. 승인 목록 적재 → 세션 복원 → 헌팅 재개 → 재시작 안내 순서."""
     load_users(app)
     await report_config(app)
     await register_commands(app)
     restored = restore_sessions(app)
-    await notify_restart(app, restored)
+    # 안내보다 먼저 재개해야 "무엇이 이어졌는지"를 담아 알릴 수 있다.
+    resumed = await restore_hunts(app)
+    await notify_restart(app, restored, resumed)
     # notify_restart 가 상태 파일을 소비했으므로, 복원된 세션 기준으로 다시 남긴다.
     # 이게 없으면 연속 재시작 시 두 번째부터 안내가 나가지 않는다.
     save_state(app)
 
 
-async def notify_restart(app: Application, restored=frozenset()):
-    """직전 실행에서 살아 있던 chat 에게 재시작을 알린다.
+async def notify_restart(app: Application, restored=frozenset(), resumed=None):
+    """재시작을 알려야 할 사람에게만 알린다.
 
-    세션이 복원된 사람에게는 재로그인을 요구하지 않는다. 헌팅은 어느 쪽이든
-    복원되지 않으므로 다시 걸어야 한다.
+    세션도 헌팅도 전부 이어졌다면 사용자 입장에서는 아무 일도 없었던 것이라
+    침묵한다. 재배포가 잦아서 그때마다 알림이 가면 소음이 된다. 실제로 조치가
+    필요한 경우(재로그인, 끊긴 헌팅)와 이어서 도는 헌팅이 있을 때만 보낸다.
+    관리자는 배포가 제대로 붙었는지 알아야 하므로 요약을 따로 받는다.
+
+    resumed 는 {chat_id: [label, ...]} 형태의 재개된 헌팅 목록이다.
     """
+    resumed = resumed or {}
+    snapshot = {}
     try:
         with open(STATE_FILE, encoding='utf-8') as f:
             snapshot = json.load(f)
     except FileNotFoundError:
-        return
+        pass
     except (OSError, ValueError) as e:
         logger.warning("상태 파일 읽기 실패: %s", e)
-        return
 
+    previous = {}
     for raw_id, labels in snapshot.items():
         try:
             chat_id = int(raw_id)
         except (TypeError, ValueError):
             logger.warning("상태 파일의 chat_id 가 정수가 아니다: %r", raw_id)
             continue
+        previous[chat_id] = list(labels or [])
+    # 상태 파일 기록이 실패했더라도 되살아난 헌팅은 알린다.
+    for chat_id in resumed:
+        previous.setdefault(chat_id, [])
 
+    relogin = []
+    for chat_id, labels in previous.items():
+        back = resumed.get(chat_id) or []
         if chat_id in restored:
-            text = "🔄 봇이 재시작됐다.\n코레일 세션은 복원됐으니 다시 로그인할 필요 없다."
-            tail = "\n\n다시 걸려면 /reserve"
+            # 헌팅 라벨은 재개 여부와 무관하게 같은 값이라 그대로 대조할 수 있다.
+            lost = [lb for lb in labels if lb not in back]
+            if not back and not lost:
+                continue  # 조용히 이어졌다 — 알릴 사건이 없다
+            blocks = []
+            if back:
+                blocks.append(
+                    f"🔄 봇이 재시작됐다. 헌팅 {len(back)}개가 이어서 실행 중이다.\n"
+                    + "\n".join(f"· {lb}" for lb in back)
+                )
+            if lost:
+                # 이어진 헌팅이 하나도 없으면 재시작 사실부터 알려야 말이 통한다.
+                head = "" if back else "🔄 봇이 재시작됐다. 코레일 세션은 복원됐다.\n\n"
+                blocks.append(
+                    head + "<b>이어가지 못한 헌팅</b>\n"
+                    + "\n".join(f"· {lb}" for lb in lost)
+                    + "\n\n/reserve 로 다시 걸어라."
+                )
+            text = "\n\n".join(blocks)
         else:
+            relogin.append(chat_id)
             text = (
                 "🔄 봇이 재시작됐다.\n"
                 "자격증명을 메모리에만 두는 구조라 로그인 세션이 초기화됐다. "
                 "/login 으로 다시 로그인하라."
             )
-            tail = "\n\n로그인 후 /reserve 로 다시 걸어야 한다."
-        if labels:
-            text += "\n\n<b>중단된 헌팅</b>\n" + "\n".join(f"· {lb}" for lb in labels) + tail
+            if labels:
+                text += (
+                    "\n\n<b>중단된 헌팅</b>\n"
+                    + "\n".join(f"· {lb}" for lb in labels)
+                    + "\n\n로그인 후 /reserve 로 다시 걸어야 한다."
+                )
         try:
             await app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
         except TelegramError as e:
             logger.warning("재시작 안내 전송 실패 (chat_id=%s): %s", chat_id, e)
 
+    await _notify_admins_restart(app, restored, resumed, relogin)
+
     try:
         os.remove(STATE_FILE)
     except OSError:
         pass
+
+
+async def _notify_admins_restart(app: Application, restored, resumed, relogin):
+    """관리자에게 재시작 요약을 보낸다.
+
+    직전 실행의 흔적이 아예 없으면(최초 기동 등) 보고할 내용도 없으므로 건너뛴다.
+    그게 아니면 재배포가 세션·헌팅을 제대로 넘겼는지 한 줄로 확인할 수 있게 한다.
+    """
+    hunts = sum(len(v) for v in resumed.values())
+    if not (restored or relogin or hunts):
+        return
+
+    parts = []
+    if restored:
+        parts.append(f"세션 {len(restored)}개")
+    if hunts:
+        parts.append(f"헌팅 {hunts}개")
+    summary = "🔄 <b>재시작됨</b> — " + (", ".join(parts) + " 복원" if parts else "복원된 세션 없음")
+    if relogin:
+        summary += f" / {len(relogin)}명 재로그인 필요"
+
+    for admin_id in admin_chat_ids():
+        try:
+            await app.bot.send_message(admin_id, summary, parse_mode=ParseMode.HTML)
+        except TelegramError as e:
+            logger.warning("재시작 요약 전송 실패 (chat_id=%s): %s", admin_id, e)
 
 
 # ---------------------------------------------------------------------------
@@ -1465,8 +1541,21 @@ async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # 헌팅 백그라운드
 # ---------------------------------------------------------------------------
-# bot_data[KEY_HUNT_TASKS] = {chat_id: {hunt_id: {'task': Task, 'label': str}}}
+# bot_data[KEY_HUNT_TASKS] = {chat_id: {hunt_id: {'task': Task, 'label': str, 'spec': dict}}}
 # hunt_id 는 chat 단위로 'h1', 'h2', ... 자동 발급. 한 chat 에서 동시 다수 헌팅 가능.
+# spec 은 재시작 때 헌팅을 그대로 되살리기 위한 직렬화 가능한 조건 묶음이다.
+
+HUNT_ALL = 'all'      # 조건에 맞는 아무 열차나
+HUNT_TRAIN = 'train'  # 지정한 열차 한 대만
+
+# ReserveOption 은 enum 이 아니라 문자열 상수 묶음이라 값이 곧 이름이다. 그래서
+# JSON 에 그대로 실을 수 있지만, 복원할 때 아는 값인지 확인해야 엉뚱한 문자열이
+# 코레일 예약 호출까지 흘러들지 않는다.
+RESERVE_OPTIONS = frozenset(
+    v for k, v in vars(ReserveOption).items()
+    if not k.startswith('_') and isinstance(v, str)
+)
+
 
 def _chat_hunts(context, chat_id):
     return context.bot_data.setdefault(KEY_HUNT_TASKS, {}).setdefault(chat_id, {})
@@ -1494,6 +1583,163 @@ def _active_hunts(context, chat_id):
     return {hid: e for hid, e in _chat_hunts(context, chat_id).items() if not e['task'].done()}
 
 
+def _load_adults(raw):
+    """예약 인원수. 값이 없거나 깨졌으면 1명으로 떨어진다.
+
+    Passenger 객체를 통째로 직렬화하지 않고 인원수만 싣는다. 객체를 담으면
+    핸드오프 포맷이 korail2 내부 구조에 묶이고, 정수 하나면 충분한 정보다.
+    """
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return PASSENGER_MIN
+    # 레코드가 깨져도 예약 인원이 폭주하지 않게 코레일이 받는 범위로 자른다.
+    return clamp_passenger_count(n)
+
+
+def _hunt_spec(label, dep, arr, d, t, interval, target=None, option=None, adults=1):
+    """헌팅을 되살리는 데 필요한 조건만 담은, JSON 으로 오갈 수 있는 dict.
+
+    target 이 있으면 특정 열차 헌팅이다. 복원 쪽이 값의 유무로 추측하지 않도록
+    종류를 kind 로 명시해 둔다.
+    """
+    spec = {
+        'kind': HUNT_TRAIN if target is not None else HUNT_ALL,
+        'label': label,
+        'dep': dep,
+        'arr': arr,
+        'd': d,
+        't': t,
+        'interval': interval,
+        # 인원을 잃으면 4명짜리 헌팅이 조용히 1명으로 예약된다. 조건의 일부다.
+        'adults': _load_adults(adults),
+    }
+    if target is not None:
+        # JSON 은 튜플을 리스트로 바꾼다. 복원할 때 튜플로 되돌려야 열차 대조가 맞는다.
+        spec['target'] = list(target)
+        spec['option'] = option
+    return spec
+
+
+def _dump_hunts(app):
+    """진행 중인 헌팅 조건을 {chat_id: [spec, ...]} 로 모은다.
+
+    조건에는 자격증명이 없지만 세션과 함께 암호화 페이로드로 나간다.
+    """
+    out = {}
+    for chat_id, hunts in (app.bot_data.get(KEY_HUNT_TASKS) or {}).items():
+        specs = []
+        for hunt_id, entry in hunts.items():
+            spec = entry.get('spec')
+            # 이미 끝난 헌팅과, 조건을 모르는(구버전) 헌팅은 되살릴 수 없다.
+            if not spec or entry['task'].done():
+                continue
+            specs.append(dict(spec, hunt_id=hunt_id))
+        if specs:
+            out[str(chat_id)] = specs
+    return out
+
+
+def _load_hunt_spec(raw):
+    """핸드오프에서 읽은 헌팅 조건을 검증해 (hunt_id, spec) 으로 돌려준다.
+
+    남이 만든 파일은 아니지만 키 변경·버전 차이로 형태가 어긋날 수 있어서,
+    루프에 넘기기 전에 여기서 걸러낸다. 이상하면 예외를 던진다.
+    """
+    kind = raw.get('kind')
+    if kind not in (HUNT_ALL, HUNT_TRAIN):
+        raise ValueError(f"알 수 없는 헌팅 종류: {kind!r}")
+
+    spec = {
+        'kind': kind,
+        'label': str(raw['label']),
+        'dep': str(raw['dep']),
+        'arr': str(raw['arr']),
+        'd': str(raw['d']),
+        't': str(raw['t']),
+        'interval': float(raw['interval']),
+        # 이 필드가 없던 시절의 레코드도 받아야 하므로 없으면 1명으로 본다.
+        'adults': _load_adults(raw.get('adults')),
+    }
+    if kind == HUNT_TRAIN:
+        target = raw['target']
+        if not isinstance(target, (list, tuple)) or len(target) != 3:
+            raise ValueError(f"열차 지정 형식이 잘못됨: {target!r}")
+        spec['target'] = tuple(str(x) for x in target)
+        option = raw['option']
+        if option not in RESERVE_OPTIONS:
+            raise ValueError(f"알 수 없는 좌석 옵션: {option!r}")
+        spec['option'] = option
+    return str(raw['hunt_id']), spec
+
+
+def _resume_hunt(context, session, chat_id, hunt_id, spec):
+    """조건 하나를 실제 task 로 되살린다. 사용자에게 보여줄 label 을 반환한다."""
+    chat_hunts = _chat_hunts(context, chat_id)
+    # 사용자가 /hunt_stop 에서 보던 번호를 그대로 유지한다. 만에 하나 겹치면
+    # 덮어써서 기존 task 를 미아로 만드는 대신 새 번호를 발급한다.
+    if hunt_id in chat_hunts:
+        hunt_id = _next_hunt_id(chat_hunts)
+    label = spec['label']
+
+    # 인원을 Passenger 리스트로 되만들어 넘긴다. 이게 빠지면 4명으로 걸어둔
+    # 헌팅이 재시작 후 조용히 1명짜리가 된다.
+    passengers = build_passengers(spec['adults'])
+    if spec['kind'] == HUNT_TRAIN:
+        coro = _train_hunt_loop(
+            context, session, chat_id, hunt_id, label, spec['target'],
+            spec['dep'], spec['arr'], spec['d'], spec['t'],
+            passengers, spec['option'], spec['interval'],
+        )
+    else:
+        coro = _hunt_loop(
+            context, session, chat_id, hunt_id, label,
+            spec['dep'], spec['arr'], spec['d'], spec['t'],
+            passengers, spec['interval'],
+        )
+    chat_hunts[hunt_id] = {'task': asyncio.create_task(coro), 'label': label, 'spec': spec}
+    return label
+
+
+async def restore_hunts(app: Application):
+    """핸드오프로 넘어온 헌팅을 다시 띄운다. {chat_id: [label, ...]} 을 반환한다.
+
+    세션이 복원된 chat 만 대상이다. 세션 없이는 코레일 호출 자체가 불가능하다.
+    헌팅 하나가 깨졌다고 기동 전체가 멈추면 안 되므로 개별로 예외를 잡는다.
+    """
+    pending = app.bot_data.pop(KEY_RESUME_HUNTS, None) or {}
+    resumed = {}
+
+    for raw_id, raw_specs in pending.items():
+        try:
+            chat_id = int(raw_id)
+        except (TypeError, ValueError):
+            logger.warning("헌팅 복원: chat_id 가 정수가 아니다: %r", raw_id)
+            continue
+
+        session = get_session(app, chat_id)
+        if session is None:
+            logger.info(
+                "헌팅 %d개 복원 안 함 (chat_id=%s) — 세션이 없어 코레일 호출이 불가능하다",
+                len(raw_specs or ()), chat_id,
+            )
+            continue
+
+        for raw in raw_specs or ():
+            try:
+                hunt_id, spec = _load_hunt_spec(raw)
+                label = _resume_hunt(app, session, chat_id, hunt_id, spec)
+            except Exception as e:
+                # 하나가 망가져도 나머지는 살린다. 조용히 넘어가면 안 되니 남긴다.
+                logger.warning("헌팅 복원 실패 (chat_id=%s): %s", chat_id, e)
+                continue
+            resumed.setdefault(chat_id, []).append(label)
+
+    if resumed:
+        logger.info("헌팅 %d개 재개", sum(len(v) for v in resumed.values()))
+    return resumed
+
+
 async def _start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = await _session_or_end(update, context)
     if session is None:
@@ -1505,7 +1751,8 @@ async def _start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arr = context.user_data[KEY_ARR]
     d = context.user_data[KEY_DATE]
     t = context.user_data[KEY_TIME]
-    passengers = passengers_of(context)
+    adults = clamp_passenger_count(context.user_data.get(KEY_ADULTS, PASSENGER_MIN))
+    passengers = build_passengers(adults)
     interval = float(os.environ.get('TELEGRAM_HUNT_INTERVAL', '3'))
 
     hunt_id = _next_hunt_id(chat_hunts)
@@ -1521,7 +1768,11 @@ async def _start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t,
                    passengers, interval)
     )
-    chat_hunts[hunt_id] = {'task': task, 'label': label}
+    chat_hunts[hunt_id] = {
+        'task': task,
+        'label': label,
+        'spec': _hunt_spec(label, dep, arr, d, t, interval, adults=adults),
+    }
     save_state(context)
 
 
@@ -1599,7 +1850,8 @@ async def _start_train_hunt(update, context, train_idx, option):
     arr = context.user_data[KEY_ARR]
     d = context.user_data[KEY_DATE]
     t = context.user_data[KEY_TIME]
-    passengers = passengers_of(context)
+    adults = clamp_passenger_count(context.user_data.get(KEY_ADULTS, PASSENGER_MIN))
+    passengers = build_passengers(adults)
     interval = float(os.environ.get('TELEGRAM_HUNT_INTERVAL', '3'))
 
     hunt_id = _next_hunt_id(chat_hunts)
@@ -1613,7 +1865,12 @@ async def _start_train_hunt(update, context, train_idx, option):
         _train_hunt_loop(context, session, chat_id, hunt_id, label, target,
                          dep, arr, d, t, passengers, option, interval)
     )
-    chat_hunts[hunt_id] = {'task': task, 'label': label}
+    chat_hunts[hunt_id] = {
+        'task': task,
+        'label': label,
+        'spec': _hunt_spec(label, dep, arr, d, t, interval,
+                           target=target, option=option, adults=adults),
+    }
     save_state(context)
 
 
