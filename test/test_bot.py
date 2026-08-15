@@ -35,6 +35,7 @@ from bot import (
     cmd_users,
     dump_sessions,
     format_reservation_success,
+    format_status,
     get_session,
     is_allowed,
     load_users,
@@ -191,6 +192,77 @@ class FormatReservationSuccessTests(unittest.TestCase):
         self.assertIn('(3석)', msg)
 
 
+class FormatStatusTests(unittest.TestCase):
+    # /reserve 를 끝낸 뒤 "지금 뭐가 돌고 있나"를 보여주는 요약. 코레일을 다시
+    # 조회하지 않고 메모리의 헌팅 목록만으로 만들어야 한다.
+
+    def _ctx_with_hunts(self, hunts):
+        ctx = MagicMock()
+        ctx.bot_data = {
+            KEY_SESSIONS: {},
+            KEY_HUNT_TASKS: {111: {
+                hid: {'task': MagicMock(done=lambda: False), 'label': label}
+                for hid, label in hunts.items()
+            }},
+        }
+        return ctx
+
+    def test_no_hunts_says_so_and_offers_reserve(self):
+        text = format_status(self._ctx_with_hunts({}), 111)
+        self.assertIn('진행 중인 헌팅 없음', text)
+        self.assertIn('/reserve', text)
+        # 멈출 게 없으면 중단 안내는 군더더기다.
+        self.assertNotIn('/hunt_stop', text)
+
+    def test_active_hunts_are_listed_with_id_and_label(self):
+        text = format_status(self._ctx_with_hunts({
+            'h1': '전체 서울→부산 06/01 10:00~',
+            'h2': '[KTX 001] 서울→부산 06/01 10:00',
+        }), 111)
+        self.assertIn('h1', text)
+        self.assertIn('h2', text)
+        self.assertIn('전체 서울→부산 06/01 10:00~', text)
+        self.assertIn('[KTX 001] 서울→부산 06/01 10:00', text)
+        self.assertIn('2개', text)
+
+    def test_hunt_list_tells_how_to_stop(self):
+        text = format_status(self._ctx_with_hunts({'h1': '서울→부산'}), 111)
+        self.assertIn('/hunt_stop', text)
+
+    def test_label_is_html_escaped(self):
+        # 역 이름은 사용자가 직접 입력할 수 있어 HTML 로 새면 안 된다.
+        text = format_status(self._ctx_with_hunts({'h1': '<b>서울</b>→부산'}), 111)
+        self.assertIn('&lt;b&gt;서울&lt;/b&gt;', text)
+        self.assertNotIn('<b>서울</b>', text)
+
+    def test_finished_hunt_is_not_listed(self):
+        ctx = MagicMock()
+        ctx.bot_data = {KEY_SESSIONS: {}, KEY_HUNT_TASKS: {111: {
+            'h1': {'task': MagicMock(done=lambda: True), 'label': '끝난 헌팅'},
+        }}}
+        text = format_status(ctx, 111)
+        self.assertIn('진행 중인 헌팅 없음', text)
+        self.assertNotIn('끝난 헌팅', text)
+
+    def test_exclude_drops_the_hunt_that_just_finished(self):
+        # 헌팅 성공 메시지는 자기 자신을 "진행 중"으로 보여주면 안 된다.
+        # (루프의 finally 가 아직 돌기 전이라 task 는 아직 done 이 아니다)
+        ctx = self._ctx_with_hunts({'h1': '방금 성공', 'h2': '아직 도는 중'})
+        text = format_status(ctx, 111, exclude='h1')
+        self.assertNotIn('방금 성공', text)
+        self.assertIn('아직 도는 중', text)
+        self.assertIn('1개', text)
+
+    def test_status_makes_no_korail_call(self):
+        # anti-bot 위험 때문에 이 요약은 네트워크를 타면 안 된다.
+        ctx = self._ctx_with_hunts({'h1': '서울→부산'})
+        korail = MagicMock()
+        ctx.bot_data[KEY_SESSIONS][111] = MagicMock(korail=korail)
+        format_status(ctx, 111)
+        korail.reservations.assert_not_called()
+        korail.search_train.assert_not_called()
+
+
 class AuthorizedChatIdTests(unittest.TestCase):
 
     def test_returns_int_when_set(self):
@@ -328,9 +400,17 @@ class HelpAndCommandMenuTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {'SESSION_HANDOFF_KEY': ''}):
             self.assertIn('재시작되면 다시 /login', _help_for(999))
 
-    async def test_commands_registered_with_admin_scope(self):
+    @staticmethod
+    def _app():
+        """register_commands 가 부르는 봇 API 를 전부 async 로 깔아둔 가짜 app."""
         app = MagicMock()
         app.bot.set_my_commands = AsyncMock()
+        app.bot.set_my_description = AsyncMock()
+        app.bot.set_my_short_description = AsyncMock()
+        return app
+
+    async def test_commands_registered_with_admin_scope(self):
+        app = self._app()
         with patch.dict(os.environ, {'TELEGRAM_ADMIN_CHAT_IDS': '111'}):
             await register_commands(app)
 
@@ -343,11 +423,33 @@ class HelpAndCommandMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('users', admin)
         self.assertEqual(calls[1].kwargs['scope'].chat_id, 111)
 
+    async def test_profile_descriptions_are_registered(self):
+        # 대화를 시작하기 전에 보이는 유일한 설명이라, 결제를 봇이 대신하지
+        # 않는다는 점이 여기 들어 있어야 한다.
+        app = self._app()
+        await register_commands(app)
+
+        description = app.bot.set_my_description.await_args.args[0]
+        short = app.bot.set_my_short_description.await_args.args[0]
+        self.assertIn('결제', description)
+        self.assertIn('결제', short)
+        # 텔레그램 제한
+        self.assertLessEqual(len(description), 512)
+        self.assertLessEqual(len(short), 120)
+
     async def test_registration_failure_does_not_break_startup(self):
-        app = MagicMock()
-        app.bot.set_my_commands = AsyncMock(side_effect=TelegramError('boom'))
+        app = self._app()
+        app.bot.set_my_commands.side_effect = TelegramError('boom')
         with patch.dict(os.environ, {'TELEGRAM_ADMIN_CHAT_IDS': '111'}):
             await register_commands(app)  # 예외가 새어나오면 안 된다
+
+    async def test_description_failure_does_not_block_command_menu(self):
+        # 소개문 등록이 실패해도 '/' 자동완성은 올라가야 한다.
+        app = self._app()
+        app.bot.set_my_description.side_effect = TelegramError('boom')
+        app.bot.set_my_short_description.side_effect = TelegramError('boom')
+        await register_commands(app)
+        app.bot.set_my_commands.assert_awaited()
 
 
 class AccessApprovalTests(unittest.IsolatedAsyncioTestCase):
