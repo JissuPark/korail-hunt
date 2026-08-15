@@ -225,20 +225,55 @@ def passengers_of(context):
 
 
 def format_reservation_success(rsv, passengers=None):
-    """예약 성공 메시지 (HTML)."""
+    """예약 성공 메시지 (HTML).
+
+    좌석을 잡아둔 것과 승차권을 산 것은 다르다. 처음 쓰는 사람이 가장 자주 놓치는
+    지점이라 결제 안내를 눈에 띄게 붙인다.
+    """
     buy_dt = f"{rsv.buy_limit_date[:4]}-{rsv.buy_limit_date[4:6]}-{rsv.buy_limit_date[6:]}"
     buy_tm = f"{rsv.buy_limit_time[:2]}:{rsv.buy_limit_time[2:4]}"
     psg_line = f"<b>인원</b>: {describe_passengers(passengers)}\n" if passengers else ""
     return (
         f"✅ <b>예약 성공</b>\n\n"
-        f"{rsv!r}\n\n"
-        f"<b>예약번호</b>: <code>{rsv.rsv_id}</code>\n"
+        f"{html.escape(repr(rsv))}\n\n"
+        f"<b>예약번호</b>: <code>{html.escape(str(rsv.rsv_id))}</code>\n"
         f"{psg_line}"
-        f"<b>구매기한</b>: {buy_dt} {buy_tm}\n"
+        f"<b>구입기한</b>: {buy_dt} {buy_tm}\n"
         f"<b>금액</b>: {rsv.price:,}원 ({rsv.seat_no_count}석)\n\n"
-        f"코레일톡 앱 → 승차권 → 결제대기에서 결제하라.\n"
-        f"기한 초과 시 자동 취소된다."
+        f"💳 <b>결제는 봇이 하지 않는다. 직접 해야 한다.</b>\n"
+        f"코레일톡 앱 → 승차권 → 결제대기 에서 위 구입기한까지 결제하라.\n"
+        f"기한(보통 10분)이 지나면 예약은 자동으로 취소된다."
     )
+
+
+def format_status(context, chat_id, exclude=None):
+    """현재 상태 요약 (HTML).
+
+    /reserve 를 끝낸 뒤 "지금 뭐가 돌고 있나"를 알기 어려워서 붙인다.
+
+    일부러 코레일을 조회하지 않는다. 헌팅 루프가 이미 같은 계정으로 몇 초마다
+    조회를 때리고 있어서, 안내 한 줄 때문에 호출을 더 얹으면 anti-bot 위험만
+    커진다. 메모리에 있는 헌팅 목록으로 충분하고, 실제 예약 내역은 이미
+    조회를 하는 /reservations 로 넘긴다.
+
+    exclude 는 방금 끝난 헌팅의 hunt_id. 루프의 finally 가 아직 돌지 않아
+    자기 자신이 "진행 중"으로 보이는 걸 막는다.
+    """
+    active = {
+        hid: entry for hid, entry in _active_hunts(context, chat_id).items()
+        if hid != exclude
+    }
+    lines = ["📋 <b>현재 상태</b>", ""]
+    if active:
+        lines.append(f"🔁 <b>진행 중인 헌팅 {len(active)}개</b>")
+        for hid, entry in active.items():
+            lines.append(f"· [<code>{html.escape(hid)}</code>] {html.escape(entry['label'])}")
+        lines.append("")
+        lines.append("중단하려면 /hunt_stop · 예약 내역은 /reservations")
+    else:
+        lines.append("🔁 진행 중인 헌팅 없음")
+        lines.append("예약 내역은 /reservations · 새로 잡으려면 /reserve")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +366,7 @@ async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     if not admins:
         # 부트스트랩: 첫 사용자에게 본인 chat_id 를 알려준다.
         await update.effective_message.reply_text(
-            "관리자가 설정되어 있지 않다.\n"
+            "⚠️ 아직 관리자가 설정되어 있지 않다.\n"
             f"이 chat_id 를 .env 의 TELEGRAM_ADMIN_CHAT_IDS 에 적고 "
             f"봇을 재시작하라: <code>{chat_id}</code>",
             parse_mode=ParseMode.HTML,
@@ -339,13 +374,13 @@ async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
         return
 
     if chat_id in users(context)['denied']:
-        await update.effective_message.reply_text("접근이 거부된 계정이다.")
+        await update.effective_message.reply_text("⛔ 접근이 거부된 계정이다.")
         return
 
     pending = context.bot_data.setdefault(KEY_PENDING, {})
     if chat_id in pending:
         await update.effective_message.reply_text(
-            "이미 승인 요청이 접수됐다. 관리자 승인을 기다려라."
+            "⏳ 이미 승인 요청이 접수됐다. 관리자가 승인하면 알림이 온다."
         )
         return
 
@@ -354,8 +389,8 @@ async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE, cha
     logger.info("접근 요청: chat_id=%s", chat_id)
 
     await update.effective_message.reply_text(
-        "이 봇은 승인된 사용자만 쓸 수 있다.\n"
-        "관리자에게 승인 요청을 보냈다. 승인되면 알림이 온다."
+        "🔒 이 봇은 승인된 사람만 쓸 수 있다.\n"
+        "관리자에게 승인 요청을 보냈으니 기다려라. 승인되면 여기로 알림이 온다."
     )
 
     kb = InlineKeyboardMarkup([[
@@ -406,7 +441,8 @@ def with_session(func):
         session = get_session(context, update.effective_chat.id)
         if session is None:
             await update.effective_message.reply_text(
-                "코레일 로그인이 필요하다. /login 을 먼저 실행하라."
+                "🔐 먼저 코레일 로그인이 필요하다.\n"
+                "/login 으로 본인 코레일 계정을 등록하라. 처음이라면 /help 를 먼저 봐라."
             )
             return ConversationHandler.END
         return await func(update, context, session, *args, **kwargs)
@@ -450,7 +486,8 @@ async def _session_or_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(context, update.effective_chat.id)
     if session is None:
         await update.effective_message.reply_text(
-            "세션이 사라졌다 (로그아웃 또는 봇 재시작). /login 후 다시 시도하라."
+            "🔐 로그인 세션이 사라졌다 (로그아웃 또는 봇 재시작).\n"
+            "/login 으로 다시 로그인한 뒤 /reserve 로 시도하라."
         )
     return session
 
@@ -844,20 +881,45 @@ async def _ensure_login(session: 'Session'):
 # ---------------------------------------------------------------------------
 
 HELP_TEXT = (
-    "korail-hunt 봇 — 각자 본인 코레일 계정으로 예약한다.\n\n"
-    "/start - 시작 / 도움말\n"
+    "🚄 <b>korail-hunt</b>\n"
+    "매진된 열차의 좌석이 풀리는지 대신 지켜보다가 자동으로 잡아주는 봇이다. "
+    "예약은 각자 본인 코레일 계정으로 이뤄진다.\n\n"
+    "<b>처음이라면 이 순서대로</b>\n"
+    "1. /login — 코레일 아이디와 비밀번호로 로그인한다\n"
+    "2. /reserve — 인원 · 날짜 · 시각 · 출발역 · 도착역을 고르면 열차 목록이 나온다\n"
+    "3. 좌석이 있으면 바로 예약되고, 매진이면 헌팅(자동 재시도)을 걸 수 있다\n"
+    "4. 좌석이 잡히면 알림이 온다\n\n"
+    "💳 <b>결제는 봇이 하지 않는다.</b>\n"
+    "봇은 좌석을 잡아둘 뿐이다. 예약 후 <b>코레일톡 앱 → 승차권 → 결제대기</b> 에서 "
+    "직접 결제해야 하고, 구입기한(보통 10분)을 넘기면 예약은 자동으로 취소된다. "
+    "이걸 놓쳐서 좌석을 날리는 경우가 제일 많다.\n\n"
+    "<b>명령어</b>\n"
     "/login - 코레일 로그인 (제일 먼저)\n"
-    "/logout - 로그아웃 (메모리에서 계정 삭제)\n"
     "/reserve - 예약 시작 (인원 → 일시 → 역 → 열차 → 옵션)\n"
-    "/reservations - 현재 예약\n"
-    "/hunt_stop - 헌팅 중단\n"
-    "/cancel - 진행 취소\n"
-    "/help - 도움말"
+    "/reservations - 현재 예약과 진행 중인 헌팅 보기\n"
+    "/hunt_stop - 진행 중인 헌팅 중단\n"
+    "/logout - 로그아웃 (메모리에서 계정 삭제)\n"
+    "/cancel - 진행 중인 입력 취소\n"
+    "/start, /help - 이 안내 다시 보기"
 )
 
 ADMIN_HELP = (
-    "\n\n<관리자>\n"
+    "\n\n👑 <b>관리자</b>\n"
     "/users - 승인된 사용자 목록 / 권한 해제"
+)
+
+# 프로필에 걸리는 소개문. 대화를 시작하기 전에 사용자가 보는 유일한 설명이라
+# 여기서부터 "결제는 직접" 을 못박는다. 텔레그램 제한은 각각 512자 / 120자다.
+BOT_DESCRIPTION = (
+    "매진된 코레일 열차의 좌석이 풀리는지 대신 지켜보다가 자동으로 예약해주는 봇이다.\n\n"
+    "각자 본인 코레일 계정으로 로그인해서 쓴다. 아이디와 비밀번호는 봇 메모리에만 "
+    "두고 디스크에 저장하지 않는다.\n\n"
+    "결제는 봇이 하지 않는다. 좌석이 잡히면 코레일톡 앱에서 직접 결제해야 하고, "
+    "구입기한(보통 10분)을 넘기면 자동으로 취소된다.\n\n"
+    "/start 로 시작하라."
+)
+BOT_SHORT_DESCRIPTION = (
+    "매진 열차 좌석을 대신 노려 자동 예약한다. 결제는 코레일톡에서 직접 해야 한다."
 )
 
 # 텔레그램에 등록할 명령어 목록. 등록해두면 사용자가 '/' 만 쳐도 자동완성
@@ -878,18 +940,35 @@ def _help_for(chat_id):
     text = HELP_TEXT
     if handoff_key():
         text += (
-            "\n\n계정 정보는 메모리에만 있다. 재시작 시 세션은 넘겨지지만, "
-            "봇이 오래 멈춰 있었다면 다시 /login 해야 한다."
+            "\n\n🔒 아이디와 비밀번호는 봇 메모리에만 있고 디스크에 저장되지 않는다. "
+            "재시작 시 세션은 넘겨지지만, 봇이 오래 멈춰 있었다면 다시 /login 해야 한다."
         )
     else:
-        text += "\n\n계정 정보는 메모리에만 있다. 봇이 재시작되면 다시 /login 해야 한다."
+        text += (
+            "\n\n🔒 아이디와 비밀번호는 봇 메모리에만 있고 디스크에 저장되지 않는다. "
+            "봇이 재시작되면 다시 /login 해야 한다."
+        )
     if chat_id in admin_chat_ids():
         text += ADMIN_HELP
     return text
 
 
 async def register_commands(app: Application):
-    """'/' 자동완성 메뉴를 채운다. 관리자에게만 /users 를 추가로 노출한다."""
+    """'/' 자동완성 메뉴와 프로필 소개문을 채운다.
+
+    관리자에게만 /users 를 추가로 노출한다. 봇 이름과 프로필 사진은 BotFather
+    에서만 바꿀 수 있어 여기서 건드리지 않는다.
+    """
+    # 소개문 등록이 실패해도 명령어 메뉴는 올라가야 하므로 따로 감싼다.
+    for setter, value in (
+        ('set_my_description', BOT_DESCRIPTION),
+        ('set_my_short_description', BOT_SHORT_DESCRIPTION),
+    ):
+        try:
+            await getattr(app.bot, setter)(value)
+        except TelegramError as e:
+            logger.warning("봇 소개문 등록 실패 (%s): %s", setter, e)
+
     try:
         await app.bot.set_my_commands(BOT_COMMANDS)
     except TelegramError as e:
@@ -906,28 +985,46 @@ async def register_commands(app: Application):
 
 @restricted
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(_help_for(update.effective_chat.id))
+    await update.message.reply_text(
+        _help_for(update.effective_chat.id), parse_mode=ParseMode.HTML,
+    )
 
 
 @restricted
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(_help_for(update.effective_chat.id))
+    await update.message.reply_text(
+        _help_for(update.effective_chat.id), parse_mode=ParseMode.HTML,
+    )
 
 
 @with_session
 async def cmd_reservations(update: Update, context: ContextTypes.DEFAULT_TYPE, session: Session):
     korail: Korail = session.korail
+    chat_id = update.effective_chat.id
     await _ensure_login(session)
     try:
         rsvs = await _korail_call(session, korail.reservations)
     except KorailError as e:
-        await update.message.reply_text(f"조회 실패: {e}")
+        await update.message.reply_text(
+            f"❌ <b>예약 조회 실패</b>\n<code>{html.escape(str(e))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
     if not rsvs:
-        await update.message.reply_text("예약 없음")
-        return
-    text = "현재 예약:\n" + "\n".join(repr(r) for r in rsvs)
-    await update.message.reply_text(text)
+        lines = ["🎫 <b>현재 예약 없음</b>", ""]
+    else:
+        lines = [f"🎫 <b>현재 예약 {len(rsvs)}건</b>", ""]
+        lines += [f"· {html.escape(repr(r))}" for r in rsvs]
+        lines += [
+            "",
+            "💳 결제는 코레일톡 앱 → 승차권 → 결제대기 에서 직접 해야 한다. "
+            "구입기한을 넘기면 자동 취소된다.",
+            "",
+        ]
+    await update.message.reply_text(
+        "\n".join(lines + [format_status(context, chat_id)]),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 @restricted
@@ -935,7 +1032,9 @@ async def cmd_hunt_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     active = _active_hunts(context, chat_id)
     if not active:
-        await update.message.reply_text("진행 중인 헌팅 없음")
+        await update.message.reply_text(
+            "진행 중인 헌팅이 없다.\n/reserve 로 새로 걸 수 있다."
+        )
         return
 
     # 1개면 바로 중단. 중단 메시지는 헌팅 루프의 CancelledError 핸들러가 보낸다.
@@ -949,7 +1048,7 @@ async def cmd_hunt_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows.append([InlineKeyboardButton("⛔ 전부 중단", callback_data="stop:all")])
     rows.append([InlineKeyboardButton("닫기", callback_data="stop:close")])
     await update.message.reply_text(
-        f"중단할 헌팅 선택 ({len(active)}개 진행 중):",
+        f"🔁 헌팅 {len(active)}개가 돌고 있다. 중단할 것을 고르라.",
         reply_markup=InlineKeyboardMarkup(rows),
     )
 
@@ -967,21 +1066,21 @@ async def cb_hunt_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     active = _active_hunts(context, chat_id)
     if not active:
-        await query.edit_message_text("진행 중인 헌팅 없음")
+        await query.edit_message_text("진행 중인 헌팅이 없다.")
         return
 
     if target == "all":
         for entry in active.values():
             entry['task'].cancel()
-        await query.edit_message_text(f"전체 헌팅 ({len(active)}개) 중단 요청")
+        await query.edit_message_text(f"⏹ 헌팅 {len(active)}개를 전부 중단한다.")
         return
 
     entry = active.get(target)
     if entry is None:
-        await query.edit_message_text(f"[{target}] 없음 (이미 끝났을 수 있음)")
+        await query.edit_message_text(f"[{target}] 을 찾을 수 없다 (이미 끝났을 수 있다).")
         return
     entry['task'].cancel()
-    await query.edit_message_text(f"[{target}] 중단 요청")
+    await query.edit_message_text(f"⏹ [{target}] 중단한다.")
 
 
 # ---------------------------------------------------------------------------
@@ -1022,9 +1121,10 @@ async def cb_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ <b>승인됨</b>\n{_user_label(info, target)}", parse_mode=ParseMode.HTML
         )
         notice = (
-            "✅ 접근이 승인됐다.\n\n"
+            "✅ 접근이 승인됐다. 이제 봇을 쓸 수 있다.\n\n"
             "/login 으로 본인 코레일 계정을 등록한 뒤 /reserve 로 시작하라.\n"
-            "예약과 결제는 전부 본인 계정으로 이뤄진다."
+            "예약은 전부 본인 계정으로 이뤄지고, 결제는 코레일톡 앱에서 직접 해야 한다.\n\n"
+            "사용법은 /help 에 있다."
         )
     else:
         data['denied'][target] = info
@@ -1033,7 +1133,7 @@ async def cb_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"⛔ <b>거부됨</b>\n{_user_label(info, target)}", parse_mode=ParseMode.HTML
         )
-        notice = "⛔ 접근 요청이 거부됐다."
+        notice = "⛔ 접근 요청이 거부됐다. 봇을 쓸 수 없다."
 
     try:
         await context.bot.send_message(target, notice)
@@ -1059,7 +1159,7 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{mark} {_user_label(info, chat_id)}")
         label = (info.get('name') or str(chat_id))[:24]
         rows.append([InlineKeyboardButton(f"⛔ {label} 해제", callback_data=f"revoke:{chat_id}")])
-    lines.append("\n🟢 = 코레일 로그인 상태")
+    lines.append("\n🟢 = 코레일 로그인 상태 · ⚪ = 승인만 된 상태")
     if data['denied']:
         lines.append(f"\n거부 목록 {len(data['denied'])}명")
 
@@ -1105,15 +1205,21 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if get_session(context, chat_id) is not None:
         await update.message.reply_text(
-            "이미 로그인되어 있다. 계정을 바꾸려면 /logout 후 다시 /login 하라."
+            "이미 로그인되어 있다. /reserve 로 바로 예약할 수 있다.\n"
+            "다른 계정으로 바꾸려면 /logout 후 다시 /login 하라."
         )
         return ConversationHandler.END
     # 진행 중이던 /reserve 대화의 잔여 상태를 정리한다.
     context.user_data.clear()
     await update.message.reply_text(
-        "코레일 아이디를 입력하라.\n"
-        "회원번호(8자리) / 이메일 / 휴대폰번호(010-0000-0000) 중 하나.\n\n"
-        "중단하려면 /cancel"
+        "🔐 <b>코레일 로그인</b>\n\n"
+        "코레일 홈페이지·코레일톡에서 쓰는 아이디를 입력하라. 셋 중 아무거나 된다.\n"
+        "· 회원번호 8자리 (예: 12345678)\n"
+        "· 이메일 (예: hong@example.com)\n"
+        "· 휴대폰번호 (예: 010-1234-5678)\n\n"
+        "비밀번호는 다음 단계에서 묻는다.\n\n"
+        "그만두려면 /cancel",
+        parse_mode=ParseMode.HTML,
     )
     return LOGIN_ID
 
@@ -1123,9 +1229,10 @@ async def login_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[KEY_LOGIN_ID] = normalize_korail_id(update.message.text)
     await context.bot.send_message(
         chat_id,
-        "비밀번호를 입력하라.\n"
-        "입력한 메시지는 봇이 즉시 삭제한다. 비밀번호는 메모리에만 보관되며 "
-        "디스크나 로그에 남지 않는다.",
+        "🔑 이어서 비밀번호를 입력하라.\n\n"
+        "입력한 메시지는 봇이 곧바로 삭제한다. 비밀번호는 봇 메모리에만 보관되며 "
+        "디스크나 로그에 남지 않는다.\n\n"
+        "그만두려면 /cancel",
     )
     return LOGIN_PW
 
@@ -1145,37 +1252,46 @@ async def login_pw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     korail_id = context.user_data.pop(KEY_LOGIN_ID, None)
     if not korail_id:
-        await context.bot.send_message(chat_id, "로그인 흐름이 끊겼다. /login 부터 다시 하라.")
+        await context.bot.send_message(
+            chat_id, "로그인 흐름이 끊겼다. /login 부터 다시 하라."
+        )
         return ConversationHandler.END
 
-    notice = await context.bot.send_message(chat_id, "로그인 중...")
+    notice = await context.bot.send_message(chat_id, "⏳ 코레일에 로그인하는 중...")
     korail = PatchedKorail(korail_id, korail_pw, auto_login=False)
     try:
         ok = await asyncio.to_thread(korail.login)
     except Exception as e:  # 네트워크·파싱 실패 등. 예외 메시지에 비번은 담기지 않는다.
         logger.warning("로그인 예외 (chat_id=%s): %s", chat_id, e)
-        await notice.edit_text(f"로그인 실패: {e}\n/login 으로 다시 시도하라.")
+        await notice.edit_text(
+            f"❌ <b>로그인 실패</b>\n<code>{html.escape(str(e))}</code>\n\n"
+            "코레일 서버나 네트워크 문제일 수 있다. 잠시 뒤 /login 으로 다시 시도하라.",
+            parse_mode=ParseMode.HTML,
+        )
         return ConversationHandler.END
 
     if not ok:
         await notice.edit_text(
-            "로그인 실패 — 아이디/비밀번호를 확인하라.\n\n"
+            "❌ <b>로그인 실패</b> — 아이디나 비밀번호가 맞지 않는다.\n\n"
             "아이디는 셋 중 하나여야 한다:\n"
             "· 회원번호 8자리 (예: 12345678)\n"
             "· 이메일 (예: hong@example.com)\n"
             "· 휴대폰번호 (예: 010-1234-5678)\n\n"
-            "'잘못 입력하셨습니다(회원번호)' 가 뜬다면 아이디가 위 형식 중 어느 것도"
-            " 아니어서 회원번호로 처리된 것이다.\n"
-            "반복 실패 시 코레일톡 앱에서 직접 로그인해 계정 상태를 확인하라.\n\n"
-            "/login 으로 다시 시도."
+            "'잘못 입력하셨습니다(회원번호)' 가 떴다면, 아이디가 위 형식 중 어느 것도 "
+            "아니어서 회원번호로 처리된 것이다.\n"
+            "코레일톡 앱에서 같은 아이디·비밀번호로 로그인되는지 먼저 확인해 보라.\n\n"
+            "다시 하려면 /login",
+            parse_mode=ParseMode.HTML,
         )
         return ConversationHandler.END
 
     sessions(context)[chat_id] = Session(korail)
     save_state(context)
     await notice.edit_text(
-        f"✅ 로그인 성공 — {korail.name} ({korail.membership_number})\n\n"
-        f"/reserve 로 예약을 시작하라."
+        f"✅ <b>로그인 성공</b>\n"
+        f"{html.escape(str(korail.name))} ({html.escape(str(korail.membership_number))})\n\n"
+        f"/reserve 로 예약을 시작하라.",
+        parse_mode=ParseMode.HTML,
     )
     return ConversationHandler.END
 
@@ -1183,7 +1299,7 @@ async def login_pw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @restricted
 async def login_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop(KEY_LOGIN_ID, None)
-    await update.message.reply_text("로그인 취소")
+    await update.message.reply_text("로그인을 취소했다. 다시 하려면 /login")
     return ConversationHandler.END
 
 
@@ -1191,14 +1307,15 @@ async def login_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if get_session(context, chat_id) is None:
-        await update.message.reply_text("로그인 상태가 아니다.")
+        await update.message.reply_text("로그인 상태가 아니다. /login 으로 로그인하라.")
         return
     stopped = _drop_user(context, chat_id)
     context.user_data.clear()
     save_state(context)
-    msg = "로그아웃 완료. 메모리에서 계정 정보를 삭제했다."
+    msg = "👋 로그아웃했다. 메모리에서 계정 정보를 지웠다."
     if stopped:
-        msg += f" (헌팅 {stopped}개 중단)"
+        msg += f"\n진행 중이던 헌팅 {stopped}개도 함께 중단했다."
+    msg += "\n\n이미 잡아둔 예약은 그대로 남아 있다. 결제는 코레일톡 앱에서 하라."
     await update.message.reply_text(msg)
 
 
@@ -1209,6 +1326,15 @@ async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 WEEKDAY_KO = ['월', '화', '수', '목', '금', '토', '일']
 DATE_OFFSETS = [0, 1, 2, 3, 4, 5, 6, 7, 14, 21, 28]
 DATE_ALIASES = {0: '오늘', 1: '내일', 2: '모레'}
+
+# ReserveOption 은 'GENERAL_FIRST' 같은 코드값이라 그대로 보여주면 안 된다.
+# 버튼에 적힌 말과 똑같이 되돌려줘야 뭘 골랐는지 헷갈리지 않는다.
+OPTION_LABELS = {
+    ReserveOption.GENERAL_FIRST: '일반 우선',
+    ReserveOption.SPECIAL_FIRST: '특실 우선',
+    ReserveOption.GENERAL_ONLY: '일반만',
+    ReserveOption.SPECIAL_ONLY: '특실만',
+}
 
 POPULAR_STATIONS = [
     '서울', '용산', '광명', '청량리',
@@ -1279,7 +1405,11 @@ async def conv_start(update: Update, context: ContextTypes.DEFAULT_TYPE, session
     context.user_data.clear()
     # 인원을 제일 먼저 받는다. 이후 검색이 곧바로 그 인원 기준으로 좌석을
     # 따져야 해서, 날짜·역보다 앞에 두는 게 흐름이 단순하다.
-    await update.message.reply_text("인원 선택 (어른):", reply_markup=_count_keyboard())
+    await update.message.reply_text(
+        "👥 <b>인원</b>을 고르라 (어른).\n언제든 /cancel 로 그만둘 수 있다.",
+        reply_markup=_count_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
     return ASK_COUNT
 
 
@@ -1287,32 +1417,40 @@ async def conv_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "cancel":
-        await query.edit_message_text("취소됨.")
+        await query.edit_message_text(CONV_CANCELLED)
         return ConversationHandler.END
     if not query.data.startswith("cnt:"):
         return ASK_COUNT
     adults = clamp_passenger_count(query.data.split(":", 1)[1])
     context.user_data[KEY_ADULTS] = adults
     await query.edit_message_text(
-        f"인원: {describe_passengers(build_passengers(adults))}\n\n출발일 선택:",
+        f"👥 인원: {describe_passengers(build_passengers(adults))}\n\n"
+        f"📅 <b>출발일</b>을 고르라.",
         reply_markup=_date_keyboard(),
+        parse_mode=ParseMode.HTML,
     )
     return ASK_DATE
+
+
+# 취소 문구는 모든 단계에서 같아야 헷갈리지 않는다.
+CONV_CANCELLED = "예약을 취소했다. 다시 하려면 /reserve"
 
 
 async def conv_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "cancel":
-        await query.edit_message_text("취소됨.")
+        await query.edit_message_text(CONV_CANCELLED)
         return ConversationHandler.END
     if not query.data.startswith("date:"):
         return ASK_DATE
     ymd = query.data.split(":", 1)[1]
     context.user_data[KEY_DATE] = ymd
     await query.edit_message_text(
-        f"출발일: {ymd[:4]}-{ymd[4:6]}-{ymd[6:]}\n\n출발 시각 선택 (이 시각 이후 열차 검색):",
+        f"📅 출발일: <b>{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}</b>\n\n"
+        f"🕐 <b>출발 시각</b>을 고르라. 이 시각 이후로 출발하는 열차를 찾는다.",
         reply_markup=_time_keyboard(),
+        parse_mode=ParseMode.HTML,
     )
     return ASK_TIME
 
@@ -1321,15 +1459,17 @@ async def conv_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "cancel":
-        await query.edit_message_text("취소됨.")
+        await query.edit_message_text(CONV_CANCELLED)
         return ConversationHandler.END
     if not query.data.startswith("time:"):
         return ASK_TIME
     hhmmss = query.data.split(":", 1)[1]
     context.user_data[KEY_TIME] = hhmmss
     await query.edit_message_text(
-        f"출발 시각: {hhmmss[:2]}:00 이후\n\n출발역 선택:",
+        f"🕐 출발 시각: <b>{hhmmss[:2]}:00 이후</b>\n\n"
+        f"🚉 <b>출발역</b>을 고르라. 목록에 없으면 '직접 입력' 을 눌러라.",
         reply_markup=_station_keyboard("dep"),
+        parse_mode=ParseMode.HTML,
     )
     return ASK_DEP
 
@@ -1338,18 +1478,20 @@ async def conv_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "cancel":
-        await query.edit_message_text("취소됨.")
+        await query.edit_message_text(CONV_CANCELLED)
         return ConversationHandler.END
     if query.data == "dep:_text":
-        await query.edit_message_text("출발역 이름을 입력하라. 예: 서울")
+        await query.edit_message_text("🚉 출발역 이름을 그대로 입력하라. 예: 서울")
         return ASK_DEP
     if not query.data.startswith("dep:"):
         return ASK_DEP
     station = query.data.split(":", 1)[1]
     context.user_data[KEY_DEP] = station
     await query.edit_message_text(
-        f"출발역: {station}\n\n도착역 선택:",
+        f"🚉 출발역: <b>{html.escape(station)}</b>\n\n"
+        f"🏁 <b>도착역</b>을 고르라.",
         reply_markup=_station_keyboard("arr"),
+        parse_mode=ParseMode.HTML,
     )
     return ASK_ARR
 
@@ -1357,8 +1499,10 @@ async def conv_dep(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def conv_dep_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[KEY_DEP] = update.message.text.strip()
     await update.message.reply_text(
-        f"출발역: {context.user_data[KEY_DEP]}\n\n도착역 선택:",
+        f"🚉 출발역: <b>{html.escape(context.user_data[KEY_DEP])}</b>\n\n"
+        f"🏁 <b>도착역</b>을 고르라.",
         reply_markup=_station_keyboard("arr"),
+        parse_mode=ParseMode.HTML,
     )
     return ASK_ARR
 
@@ -1367,16 +1511,19 @@ async def conv_arr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "cancel":
-        await query.edit_message_text("취소됨.")
+        await query.edit_message_text(CONV_CANCELLED)
         return ConversationHandler.END
     if query.data == "arr:_text":
-        await query.edit_message_text("도착역 이름을 입력하라. 예: 부산")
+        await query.edit_message_text("🏁 도착역 이름을 그대로 입력하라. 예: 부산")
         return ASK_ARR
     if not query.data.startswith("arr:"):
         return ASK_ARR
     station = query.data.split(":", 1)[1]
     context.user_data[KEY_ARR] = station
-    await query.edit_message_text(f"도착역: {station}\n\n열차 검색 중...")
+    await query.edit_message_text(
+        f"🏁 도착역: <b>{html.escape(station)}</b>\n\n🔎 열차를 찾는 중...",
+        parse_mode=ParseMode.HTML,
+    )
     return await _show_trains(update, context)
 
 
@@ -1408,8 +1555,15 @@ async def _show_trains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except NoResultsError:
         trains = []
     except KorailError as e:
-        await update.effective_message.reply_text(f"검색 실패: {e}")
+        await update.effective_message.reply_text(
+            f"❌ <b>열차 검색 실패</b>\n<code>{html.escape(str(e))}</code>\n\n"
+            f"역 이름이 정확한지 확인하고 /reserve 로 다시 시도하라.",
+            parse_mode=ParseMode.HTML,
+        )
         return ConversationHandler.END
+
+    route = f"{html.escape(dep)} → {html.escape(arr)}"
+    when = f"{d[:4]}-{d[4:6]}-{d[6:]} {t[:2]}:{t[2:4]} 이후"
 
     if not trains:
         kb = InlineKeyboardMarkup([[
@@ -1417,19 +1571,27 @@ async def _show_trains(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("취소", callback_data="cancel"),
         ]])
         await update.effective_message.reply_text(
-            f"{dep} → {arr} {d} {t}\n좌석 없음.",
+            f"🔎 <b>{route}</b>\n{when}\n\n"
+            f"지금은 잡을 수 있는 열차가 없다 (매진이거나 운행이 없다).\n"
+            f"[🔁 헌팅 시작] 을 누르면 좌석이 풀릴 때까지 대신 계속 조회한다.",
             reply_markup=kb,
+            parse_mode=ParseMode.HTML,
         )
         return SELECT_TRAIN
 
     context.user_data[KEY_TRAINS] = trains
-    text_lines = [f"{dep} → {arr} {d} {t}", ""]
+    text_lines = [f"🔎 <b>{route}</b>", when, ""]
     buttons = []
     for i, tr in enumerate(trains):
-        marker = "" if tr.has_seat() else " (매진)"
-        text_lines.append(f"[{i + 1}] {tr!r}{marker}")
-        label = f"#{i + 1} 선택" if tr.has_seat() else f"#{i + 1} 헌팅"
+        marker = "" if tr.has_seat() else " ❌매진"
+        text_lines.append(f"[{i + 1}] {html.escape(repr(tr))}{marker}")
+        label = f"#{i + 1} 예약" if tr.has_seat() else f"#{i + 1} 헌팅"
         buttons.append([InlineKeyboardButton(label, callback_data=f"train:{i}")])
+    text_lines += [
+        "",
+        "번호를 누르면 그 열차를 예약한다. 매진된 열차를 고르면 "
+        "좌석이 풀릴 때까지 노리는 헌팅이 걸린다.",
+    ]
     buttons.append([
         InlineKeyboardButton("🔁 전체 헌팅", callback_data="hunt"),
         InlineKeyboardButton("취소", callback_data="cancel"),
@@ -1437,6 +1599,7 @@ async def _show_trains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "\n".join(text_lines),
         reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.HTML,
     )
     return SELECT_TRAIN
 
@@ -1447,11 +1610,12 @@ async def conv_train_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "cancel":
-        await query.edit_message_text("취소")
+        await query.edit_message_text(CONV_CANCELLED)
         return ConversationHandler.END
 
     if data == "hunt":
-        await query.edit_message_text(query.message.text + "\n\n(헌팅 시작)")
+        # query.message.text 는 서식이 벗겨진 평문이라 parse_mode 없이 되돌려준다.
+        await query.edit_message_text(query.message.text + "\n\n🔁 헌팅을 시작한다...")
         await _start_hunt(update, context)
         return ConversationHandler.END
 
@@ -1471,8 +1635,12 @@ async def conv_train_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("취소", callback_data="cancel")],
         ])
         await query.edit_message_text(
-            f"선택: {train!r}\n\n좌석 옵션:",
+            f"🚄 {html.escape(repr(train))}\n\n"
+            f"💺 <b>좌석 옵션</b>을 고르라.\n"
+            f"'우선' 은 그쪽을 먼저 보되 없으면 다른 쪽도 잡고, "
+            f"'만' 은 그 등급만 잡는다.",
             reply_markup=kb,
+            parse_mode=ParseMode.HTML,
         )
         return SELECT_OPTION
 
@@ -1483,7 +1651,7 @@ async def conv_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "cancel":
-        await query.edit_message_text("취소")
+        await query.edit_message_text(CONV_CANCELLED)
         return ConversationHandler.END
     if not query.data.startswith("opt:"):
         return SELECT_OPTION
@@ -1499,33 +1667,48 @@ async def conv_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 매진 열차면 예약 시도 건너뛰고 즉시 해당 열차 헌팅 시작.
     if not train.has_seat():
-        await query.edit_message_text(f"{train!r}\n좌석 없음 — 이 열차 헌팅 시작")
+        await query.edit_message_text(
+            f"🚄 {html.escape(repr(train))}\n\n"
+            f"매진이라 바로 예약할 수 없다. 이 열차만 노리는 헌팅을 건다.",
+            parse_mode=ParseMode.HTML,
+        )
         await _start_train_hunt(update, context, train_idx, option)
         return ConversationHandler.END
 
-    await query.edit_message_text(f"예약 중... {train!r}")
+    await query.edit_message_text(
+        f"⏳ 예약하는 중...\n{html.escape(repr(train))}", parse_mode=ParseMode.HTML,
+    )
     await _ensure_login(session)
     try:
         rsv = await _korail_call(session, korail.reserve, train, passengers, option, False)
     except SoldOutError:
         # 검색 후 예약 직전에 매진 — 같은 열차로 헌팅 fallback.
         await update.effective_message.reply_text(
-            f"{train!r}\n예약 직전 매진 — 이 열차 헌팅 시작"
+            f"🚄 {html.escape(repr(train))}\n\n"
+            f"예약을 넣기 직전에 매진됐다. 이 열차만 노리는 헌팅을 건다.",
+            parse_mode=ParseMode.HTML,
         )
         await _start_train_hunt(update, context, train_idx, option)
         return ConversationHandler.END
     except KorailError as e:
-        await update.effective_message.reply_text(f"예약 실패: {e}")
+        await update.effective_message.reply_text(
+            f"❌ <b>예약 실패</b>\n<code>{html.escape(str(e))}</code>\n\n"
+            f"/reserve 로 다시 시도하라.",
+            parse_mode=ParseMode.HTML,
+        )
         return ConversationHandler.END
 
     if rsv is None:
         await update.effective_message.reply_text(
-            "예약은 시도했지만 응답을 해석하지 못했다. /reservations 로 확인하라."
+            "⚠️ 예약은 시도했지만 코레일 응답을 해석하지 못했다.\n"
+            "/reservations 로 실제로 잡혔는지 확인하라."
         )
         return ConversationHandler.END
 
     await update.effective_message.reply_text(
-        format_reservation_success(rsv, passengers),
+        format_reservation_success(rsv, passengers)
+        + "\n\n"
+        + format_status(context, update.effective_chat.id),
         parse_mode=ParseMode.HTML,
     )
     return ConversationHandler.END
@@ -1534,7 +1717,7 @@ async def conv_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @restricted
 async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("취소")
+    await update.message.reply_text(CONV_CANCELLED)
     return ConversationHandler.END
 
 
@@ -1758,10 +1941,8 @@ async def _start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hunt_id = _next_hunt_id(chat_hunts)
     label = _format_hunt_label(dep, arr, d, t, train=None, passengers=passengers)
 
-    await update.effective_message.reply_text(
-        f"[{hunt_id}] {label}\n전체 헌팅 시작 (간격 {interval}s). /hunt_stop 으로 중단."
-    )
-
+    # 상태 요약에 방금 건 헌팅까지 들어가도록 등록을 먼저 한다. 등록 자체는
+    # 동기라 안내를 보내기 전에 확정된다.
     # 인원은 헌팅이 도는 내내 고정이라 루프 시작 시점의 값을 넘긴다.
     # user_data 를 루프 안에서 다시 읽으면 다음 /reserve 가 값을 덮어쓴다.
     task = asyncio.create_task(
@@ -1774,6 +1955,14 @@ async def _start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'spec': _hunt_spec(label, dep, arr, d, t, interval, adults=adults),
     }
     save_state(context)
+
+    await update.effective_message.reply_text(
+        f"🔁 <b>헌팅 시작</b> — [<code>{hunt_id}</code>] {html.escape(label)}\n"
+        f"조건에 맞는 열차를 {interval:g}초마다 다시 조회한다. "
+        f"좌석이 잡히면 바로 알린다. 그동안 다른 일을 봐도 된다.\n\n"
+        + format_status(context, chat_id),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t,
@@ -1812,24 +2001,36 @@ async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t,
                 await asyncio.sleep(interval)
                 continue
             except KorailError as e:
-                await bot.send_message(chat_id, f"[{hunt_id}] 예약 실패: {e}")
+                await bot.send_message(
+                    chat_id,
+                    f"❌ <b>[{hunt_id}] 헌팅 중 예약 실패</b>\n"
+                    f"<code>{html.escape(str(e))}</code>\n\n"
+                    f"헌팅을 멈춘다. /reserve 로 다시 걸어라.",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
 
             if rsv is None:
                 await bot.send_message(
                     chat_id,
-                    f"[{hunt_id}] 예약 시도했지만 응답 해석 실패. /reservations 확인.",
+                    f"⚠️ [{hunt_id}] 예약은 시도했지만 코레일 응답을 해석하지 못했다.\n"
+                    f"/reservations 로 실제로 잡혔는지 확인하라.",
                 )
                 return
 
             await bot.send_message(
                 chat_id,
-                f"🎉 [{hunt_id}] {label}\n헌팅 성공 ({attempts}회 시도)\n\n{format_reservation_success(rsv, passengers)}",
+                f"🎉 <b>헌팅 성공</b> — [{hunt_id}] {html.escape(label)}\n"
+                f"{attempts}회 만에 잡았다.\n\n"
+                f"{format_reservation_success(rsv, passengers)}\n\n"
+                f"{format_status(context, chat_id, exclude=hunt_id)}",
                 parse_mode=ParseMode.HTML,
             )
             return
     except asyncio.CancelledError:
-        await bot.send_message(chat_id, f"[{hunt_id}] 헌팅 중단 ({attempts}회 시도)")
+        await bot.send_message(
+            chat_id, f"⏹ [{hunt_id}] 헌팅을 중단했다 ({attempts}회 시도).",
+        )
         raise
     finally:
         _chat_hunts(context, chat_id).pop(hunt_id, None)
@@ -1857,10 +2058,7 @@ async def _start_train_hunt(update, context, train_idx, option):
     hunt_id = _next_hunt_id(chat_hunts)
     label = _format_hunt_label(dep, arr, d, t, train=train, passengers=passengers)
 
-    await update.effective_message.reply_text(
-        f"[{hunt_id}] {label}\n옵션: {option}, 간격 {interval}s. /hunt_stop 으로 중단."
-    )
-
+    # 상태 요약에 방금 건 헌팅까지 들어가도록 등록을 먼저 한다.
     task = asyncio.create_task(
         _train_hunt_loop(context, session, chat_id, hunt_id, label, target,
                          dep, arr, d, t, passengers, option, interval)
@@ -1872,6 +2070,15 @@ async def _start_train_hunt(update, context, train_idx, option):
                            target=target, option=option, adults=adults),
     }
     save_state(context)
+
+    await update.effective_message.reply_text(
+        f"🔁 <b>헌팅 시작</b> — [<code>{hunt_id}</code>] {html.escape(label)}\n"
+        f"이 열차만 {interval:g}초마다 다시 조회한다 "
+        f"(좌석 옵션: {html.escape(OPTION_LABELS.get(option, str(option)))}). "
+        f"좌석이 풀리면 바로 알린다.\n\n"
+        + format_status(context, chat_id),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target,
@@ -1916,24 +2123,36 @@ async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target,
                 await asyncio.sleep(interval)
                 continue
             except KorailError as e:
-                await bot.send_message(chat_id, f"[{hunt_id}] 예약 실패: {e}")
+                await bot.send_message(
+                    chat_id,
+                    f"❌ <b>[{hunt_id}] 헌팅 중 예약 실패</b>\n"
+                    f"<code>{html.escape(str(e))}</code>\n\n"
+                    f"헌팅을 멈춘다. /reserve 로 다시 걸어라.",
+                    parse_mode=ParseMode.HTML,
+                )
                 return
 
             if rsv is None:
                 await bot.send_message(
                     chat_id,
-                    f"[{hunt_id}] 예약 시도했지만 응답 해석 실패. /reservations 확인.",
+                    f"⚠️ [{hunt_id}] 예약은 시도했지만 코레일 응답을 해석하지 못했다.\n"
+                    f"/reservations 로 실제로 잡혔는지 확인하라.",
                 )
                 return
 
             await bot.send_message(
                 chat_id,
-                f"🎉 [{hunt_id}] {label}\n열차 헌팅 성공 ({attempts}회 시도)\n\n{format_reservation_success(rsv, passengers)}",
+                f"🎉 <b>헌팅 성공</b> — [{hunt_id}] {html.escape(label)}\n"
+                f"{attempts}회 만에 잡았다.\n\n"
+                f"{format_reservation_success(rsv, passengers)}\n\n"
+                f"{format_status(context, chat_id, exclude=hunt_id)}",
                 parse_mode=ParseMode.HTML,
             )
             return
     except asyncio.CancelledError:
-        await bot.send_message(chat_id, f"[{hunt_id}] 열차 헌팅 중단 ({attempts}회 시도)")
+        await bot.send_message(
+            chat_id, f"⏹ [{hunt_id}] 헌팅을 중단했다 ({attempts}회 시도).",
+        )
         raise
     finally:
         _chat_hunts(context, chat_id).pop(hunt_id, None)
