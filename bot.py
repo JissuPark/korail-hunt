@@ -47,7 +47,13 @@ try:
 except ImportError:
     pass
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -615,6 +621,7 @@ async def snapshot_on_stop(app: Application):
 async def on_startup(app: Application):
     """post_init 훅. 승인 목록 적재 → 세션 복원 → 재시작 안내 순서."""
     load_users(app)
+    await register_commands(app)
     restored = restore_sessions(app)
     await notify_restart(app, restored)
     # notify_restart 가 상태 파일을 소비했으므로, 복원된 세션 기준으로 다시 남긴다.
@@ -692,14 +699,14 @@ async def _ensure_login(session: 'Session'):
 
 HELP_TEXT = (
     "korail-hunt 봇 — 각자 본인 코레일 계정으로 예약한다.\n\n"
+    "/start - 시작 / 도움말\n"
     "/login - 코레일 로그인 (제일 먼저)\n"
     "/logout - 로그아웃 (메모리에서 계정 삭제)\n"
     "/reserve - 예약 시작 (일시 → 역 → 열차 → 옵션)\n"
     "/reservations - 현재 예약\n"
     "/hunt_stop - 헌팅 중단\n"
     "/cancel - 진행 취소\n"
-    "/help - 도움말\n\n"
-    "계정 정보는 메모리에만 있다. 봇이 재시작되면 다시 /login 해야 한다."
+    "/help - 도움말"
 )
 
 ADMIN_HELP = (
@@ -707,11 +714,48 @@ ADMIN_HELP = (
     "/users - 승인된 사용자 목록 / 권한 해제"
 )
 
+# 텔레그램에 등록할 명령어 목록. 등록해두면 사용자가 '/' 만 쳐도 자동완성
+# 메뉴가 뜬다. 없으면 새 사용자는 명령어를 미리 알고 있어야 한다.
+BOT_COMMANDS = [
+    BotCommand('login', '코레일 로그인'),
+    BotCommand('reserve', '예약 시작'),
+    BotCommand('reservations', '현재 예약'),
+    BotCommand('hunt_stop', '헌팅 중단'),
+    BotCommand('logout', '로그아웃'),
+    BotCommand('cancel', '진행 취소'),
+    BotCommand('help', '도움말'),
+]
+ADMIN_COMMANDS = BOT_COMMANDS + [BotCommand('users', '사용자 관리')]
+
 
 def _help_for(chat_id):
+    text = HELP_TEXT
+    if handoff_key():
+        text += (
+            "\n\n계정 정보는 메모리에만 있다. 재시작 시 세션은 넘겨지지만, "
+            "봇이 오래 멈춰 있었다면 다시 /login 해야 한다."
+        )
+    else:
+        text += "\n\n계정 정보는 메모리에만 있다. 봇이 재시작되면 다시 /login 해야 한다."
     if chat_id in admin_chat_ids():
-        return HELP_TEXT + ADMIN_HELP
-    return HELP_TEXT
+        text += ADMIN_HELP
+    return text
+
+
+async def register_commands(app: Application):
+    """'/' 자동완성 메뉴를 채운다. 관리자에게만 /users 를 추가로 노출한다."""
+    try:
+        await app.bot.set_my_commands(BOT_COMMANDS)
+    except TelegramError as e:
+        logger.warning("명령어 목록 등록 실패: %s", e)
+        return
+    for admin_id in admin_chat_ids():
+        try:
+            await app.bot.set_my_commands(
+                ADMIN_COMMANDS, scope=BotCommandScopeChat(admin_id),
+            )
+        except TelegramError as e:
+            logger.warning("관리자 명령어 등록 실패 (chat_id=%s): %s", admin_id, e)
 
 
 @restricted

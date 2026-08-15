@@ -11,6 +11,8 @@ import unittest
 from datetime import date
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from telegram.error import TelegramError
+
 import bot
 from bot import (
     KEY_HUNT_TASKS,
@@ -21,6 +23,7 @@ from bot import (
     LOGIN_ID,
     LOGIN_PW,
     Session,
+    _help_for,
     allowed_chat_ids,
     authorized_chat_id,
     cb_access,
@@ -40,6 +43,7 @@ from bot import (
     notify_restart,
     parse_date,
     parse_time,
+    register_commands,
     restore_sessions,
     save_state,
     snapshot_on_stop,
@@ -304,6 +308,44 @@ class AuthGateTests(unittest.IsolatedAsyncioTestCase):
             up = _update(999)
             await cmd_reservations(up, ctx)
         self.assertIn('/login', up.effective_message.reply_text.await_args[0][0])
+
+
+class HelpAndCommandMenuTests(unittest.IsolatedAsyncioTestCase):
+
+    def test_help_lists_start(self):
+        self.assertIn('/start', _help_for(999))
+
+    def test_admin_sees_users_command(self):
+        with patch.dict(os.environ, {'TELEGRAM_ADMIN_CHAT_IDS': '111'}):
+            self.assertIn('/users', _help_for(111))
+            self.assertNotIn('/users', _help_for(999))
+
+    def test_help_reflects_handoff_setting(self):
+        with patch.dict(os.environ, {'SESSION_HANDOFF_KEY': 'k'}):
+            self.assertIn('세션은 넘겨지지만', _help_for(999))
+        with patch.dict(os.environ, {'SESSION_HANDOFF_KEY': ''}):
+            self.assertIn('재시작되면 다시 /login', _help_for(999))
+
+    async def test_commands_registered_with_admin_scope(self):
+        app = MagicMock()
+        app.bot.set_my_commands = AsyncMock()
+        with patch.dict(os.environ, {'TELEGRAM_ADMIN_CHAT_IDS': '111'}):
+            await register_commands(app)
+
+        calls = app.bot.set_my_commands.await_args_list
+        self.assertEqual(len(calls), 2)
+        default = [c.command for c in calls[0].args[0]]
+        admin = [c.command for c in calls[1].args[0]]
+        self.assertIn('login', default)
+        self.assertNotIn('users', default)  # 관리자 명령은 전체에 노출하지 않는다
+        self.assertIn('users', admin)
+        self.assertEqual(calls[1].kwargs['scope'].chat_id, 111)
+
+    async def test_registration_failure_does_not_break_startup(self):
+        app = MagicMock()
+        app.bot.set_my_commands = AsyncMock(side_effect=TelegramError('boom'))
+        with patch.dict(os.environ, {'TELEGRAM_ADMIN_CHAT_IDS': '111'}):
+            await register_commands(app)  # 예외가 새어나오면 안 된다
 
 
 class AccessApprovalTests(unittest.IsolatedAsyncioTestCase):
