@@ -18,7 +18,12 @@ COPY bot.py korail.py ./
 
 # 런타임 상태(.bot_users.json, .bot_state.json, 핸드오프)는 전부 여기에 둔다.
 # compose 에서 볼륨으로 걸어 컨테이너 교체에도 살아남게 한다.
-RUN mkdir -p /app/data && useradd -m -u 10001 bot && chown -R bot:bot /app
+# uid 를 호스트 첫 사용자와 맞춘다. /app/data 는 바인드 마운트라 호스트
+# 디렉터리의 소유권이 이미지 설정을 덮어쓰고, uid 가 어긋나면 컨테이너가
+# 아무것도 기록하지 못한다. 클라우드 이미지의 첫 사용자는 관례상 1000
+# (rocky/ubuntu/ec2-user). 다르면 --build-arg APP_UID=... 로 맞춰라.
+ARG APP_UID=1000
+RUN mkdir -p /app/data && useradd -m -u ${APP_UID} bot && chown -R bot:bot /app
 USER bot
 
 ENV BOT_USERS_FILE=/app/data/.bot_users.json \

@@ -36,6 +36,7 @@ from bot import (
     load_users,
     login_id,
     login_pw,
+    normalize_korail_id,
     notify_restart,
     parse_date,
     parse_time,
@@ -135,6 +136,32 @@ class ParseTimeTests(unittest.TestCase):
     def test_wrong_length_raises(self):
         with self.assertRaises(ValueError):
             parse_time('10000')
+
+
+class NormalizeKorailIdTests(unittest.TestCase):
+    # 코레일은 휴대폰번호를 하이픈 형식으로만 인식한다. 붙여 쓴 번호가
+    # 회원번호로 오인돼 로그인이 실패하던 문제를 막는다.
+
+    def test_11_digit_mobile_gets_hyphens(self):
+        self.assertEqual(normalize_korail_id('01012345678'), '010-1234-5678')
+
+    def test_10_digit_mobile_gets_hyphens(self):
+        self.assertEqual(normalize_korail_id('0111234567'), '011-123-4567')
+
+    def test_already_hyphenated_is_untouched(self):
+        self.assertEqual(normalize_korail_id('010-1234-5678'), '010-1234-5678')
+
+    def test_8_digit_membership_number_is_untouched(self):
+        self.assertEqual(normalize_korail_id('12345678'), '12345678')
+
+    def test_email_is_untouched(self):
+        self.assertEqual(normalize_korail_id('hong@example.com'), 'hong@example.com')
+
+    def test_whitespace_stripped(self):
+        self.assertEqual(normalize_korail_id('  01012345678  '), '010-1234-5678')
+
+    def test_digits_not_starting_with_zero_are_untouched(self):
+        self.assertEqual(normalize_korail_id('12345678901'), '12345678901')
 
 
 class FormatReservationSuccessTests(unittest.TestCase):

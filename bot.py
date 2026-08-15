@@ -124,6 +124,22 @@ def parse_date(text, today=None):
     raise ValueError(f"날짜 형식을 인식할 수 없음: {text!r}. YYYYMMDD / 오늘 / 내일 / +N 사용")
 
 
+def normalize_korail_id(text):
+    """코레일 로그인 ID 정규화.
+
+    코레일은 휴대폰번호를 하이픈 형식(PHONE_NUMBER_REGEX)으로만 인식한다.
+    '01012345678' 처럼 붙여 쓰면 회원번호로 분류돼 '잘못 입력하셨습니다(회원번호)'
+    로 거부되므로 여기서 하이픈을 넣어준다. 회원번호는 8자리라 10~11자리인
+    휴대폰번호와 겹치지 않는다.
+    """
+    text = text.strip()
+    if text.isdigit() and text.startswith('0') and len(text) in (10, 11):
+        if len(text) == 11:
+            return f"{text[:3]}-{text[3:7]}-{text[7:]}"
+        return f"{text[:3]}-{text[3:6]}-{text[6:]}"
+    return text
+
+
 def parse_time(text):
     """HHMM / HHMMSS / HH:MM / HH:MM:SS 형식을 HHMMSS 로 변환."""
     text = text.strip().replace(':', '')
@@ -914,7 +930,7 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def login_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    context.user_data[KEY_LOGIN_ID] = update.message.text.strip()
+    context.user_data[KEY_LOGIN_ID] = normalize_korail_id(update.message.text)
     await context.bot.send_message(
         chat_id,
         "비밀번호를 입력하라.\n"
@@ -953,8 +969,14 @@ async def login_pw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not ok:
         await notice.edit_text(
-            "로그인 실패 — 아이디/비밀번호를 확인하라.\n"
-            "반복 실패 시 코레일톡 앱에서 직접 로그인해 계정 상태를 확인하라.\n"
+            "로그인 실패 — 아이디/비밀번호를 확인하라.\n\n"
+            "아이디는 셋 중 하나여야 한다:\n"
+            "· 회원번호 8자리 (예: 12345678)\n"
+            "· 이메일 (예: hong@example.com)\n"
+            "· 휴대폰번호 (예: 010-1234-5678)\n\n"
+            "'잘못 입력하셨습니다(회원번호)' 가 뜬다면 아이디가 위 형식 중 어느 것도"
+            " 아니어서 회원번호로 처리된 것이다.\n"
+            "반복 실패 시 코레일톡 앱에서 직접 로그인해 계정 상태를 확인하라.\n\n"
             "/login 으로 다시 시도."
         )
         return ConversationHandler.END
