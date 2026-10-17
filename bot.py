@@ -1385,7 +1385,11 @@ def _date_keyboard(today=None):
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("취소", callback_data="cancel")])
+    # 버튼은 +7 이후 주 단위라 그 사이 날짜는 직접 입력으로만 고를 수 있다.
+    rows.append([
+        InlineKeyboardButton("직접 입력", callback_data="date:_text"),
+        InlineKeyboardButton("취소", callback_data="cancel"),
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1442,11 +1446,38 @@ async def conv_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "cancel":
         await query.edit_message_text(CONV_CANCELLED)
         return ConversationHandler.END
+    if query.data == "date:_text":
+        await query.edit_message_text(DATE_TEXT_PROMPT)
+        return ASK_DATE
     if not query.data.startswith("date:"):
         return ASK_DATE
     ymd = query.data.split(":", 1)[1]
     context.user_data[KEY_DATE] = ymd
     await query.edit_message_text(
+        f"📅 출발일: <b>{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}</b>\n\n"
+        f"🕐 <b>출발 시각</b>을 고르라. 이 시각 이후로 출발하는 열차를 찾는다.",
+        reply_markup=_time_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
+    return ASK_TIME
+
+
+DATE_TEXT_PROMPT = "📅 출발일을 입력하라. 예: 20261030 / +10 (오늘부터 10일 뒤) / 내일"
+
+
+async def conv_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # parse_date 는 8자리 숫자면 그대로 돌려주므로 실제 달력 날짜인지 따로 본다.
+    try:
+        ymd = parse_date(update.message.text)
+        d = date(int(ymd[:4]), int(ymd[4:6]), int(ymd[6:]))
+    except ValueError:
+        await update.message.reply_text(f"날짜를 알아볼 수 없다.\n{DATE_TEXT_PROMPT}")
+        return ASK_DATE
+    if d < date.today():
+        await update.message.reply_text(f"이미 지난 날짜다.\n{DATE_TEXT_PROMPT}")
+        return ASK_DATE
+    context.user_data[KEY_DATE] = ymd
+    await update.message.reply_text(
         f"📅 출발일: <b>{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}</b>\n\n"
         f"🕐 <b>출발 시각</b>을 고르라. 이 시각 이후로 출발하는 열차를 찾는다.",
         reply_markup=_time_keyboard(),
@@ -2296,7 +2327,10 @@ def main():
         entry_points=[CommandHandler('reserve', conv_start)],
         states={
             ASK_COUNT: [CallbackQueryHandler(conv_count, pattern=r"^(cnt:|cancel$)")],
-            ASK_DATE: [CallbackQueryHandler(conv_date, pattern=r"^(date:|cancel$)")],
+            ASK_DATE: [
+                CallbackQueryHandler(conv_date, pattern=r"^(date:|cancel$)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_date_text),
+            ],
             ASK_TIME: [CallbackQueryHandler(conv_time, pattern=r"^(time:|cancel$)")],
             ASK_DEP: [
                 CallbackQueryHandler(conv_dep, pattern=r"^(dep:|cancel$)"),
