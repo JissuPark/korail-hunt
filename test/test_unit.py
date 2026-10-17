@@ -310,6 +310,14 @@ class ResultCheckTests(unittest.TestCase):
         # 서브클래스가 아닌 base 여야 한다
         self.assertIs(type(cm.exception), KorailError)
 
+    def test_missing_str_result_raises_korail_error_with_raw_body(self):
+        # 차단·점검 응답처럼 strResult 가 없으면 KeyError 대신 KorailError 여야
+        # 호출부의 except KorailError 가 잡고, 원문 일부가 메시지에 남아야 원인을 본다.
+        with self.assertRaises(KorailError) as cm:
+            self.k._result_check({"MACRO_ERROR": "차단"})
+        self.assertIs(type(cm.exception), KorailError)
+        self.assertIn("MACRO_ERROR", str(cm.exception))
+
 
 # ---------------------------------------------------------------------------
 # Korail.login

@@ -1221,6 +1221,44 @@ class ConvDateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('지난', up.message.reply_text.await_args[0][0])
 
 
+class OnErrorTests(unittest.IsolatedAsyncioTestCase):
+    # 처리되지 않은 예외는 관리자에게만 알린다. polling 끊김은 알리지 않는다.
+
+    def setUp(self):
+        bot._last_error_alert.clear()
+        patcher = patch.dict(os.environ, {'TELEGRAM_ADMIN_CHAT_IDS': '111'})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _ctx_with_error(self, err):
+        ctx = _ctx()
+        ctx.error = err
+        return ctx
+
+    async def test_unhandled_error_alerts_admin_only(self):
+        ctx = self._ctx_with_error(KeyError('strResult'))
+        await bot.on_error(_update(222), ctx)
+        ctx.bot.send_message.assert_awaited_once()
+        self.assertEqual(ctx.bot.send_message.await_args[0][0], 111)
+        self.assertIn('KeyError', ctx.bot.send_message.await_args[0][1])
+
+    async def test_network_error_is_not_alerted(self):
+        ctx = self._ctx_with_error(bot.NetworkError('read error'))
+        await bot.on_error(None, ctx)
+        ctx.bot.send_message.assert_not_awaited()
+
+    async def test_same_error_is_alerted_once_per_interval(self):
+        ctx = self._ctx_with_error(KeyError('strResult'))
+        await bot.on_error(None, ctx)
+        await bot.on_error(None, ctx)
+        self.assertEqual(ctx.bot.send_message.await_count, 1)
+
+    async def test_send_failure_does_not_raise(self):
+        ctx = self._ctx_with_error(ValueError('boom'))
+        ctx.bot.send_message = AsyncMock(side_effect=TelegramError('blocked'))
+        await bot.on_error(None, ctx)
+
+
 class HuntLabelTests(unittest.TestCase):
     # 여러 헌팅이 동시에 도는데 인원이 안 보이면 어느 게 몇 명짜리인지 모른다.
 

@@ -55,7 +55,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import NetworkError, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1586,6 +1586,7 @@ async def _show_trains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except NoResultsError:
         trains = []
     except KorailError as e:
+        logger.warning("열차 검색 실패: %s", e)
         await update.effective_message.reply_text(
             f"❌ <b>열차 검색 실패</b>\n<code>{html.escape(str(e))}</code>\n\n"
             f"역 이름이 정확한지 확인하고 /reserve 로 다시 시도하라.",
@@ -2274,6 +2275,38 @@ async def report_config(app: Application):
             logger.warning("설정 경고 전송 실패 (chat_id=%s): %s", admin_id, e)
 
 
+# 같은 오류가 반복되면(예: 다른 곳에서 같은 토큰으로 polling → Conflict) 몇 초마다
+# 알림이 쏟아진다. 같은 내용은 이 간격 안에 한 번만 보낸다.
+ERROR_ALERT_INTERVAL = 600
+_last_error_alert: dict = {}
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """처리되지 않은 예외를 로그로 남기고 관리자에게만 알린다."""
+    err = context.error
+    # long polling 연결 끊김은 흔하고 PTB 가 알아서 재시도한다. 알릴 일이 아니다.
+    if isinstance(err, NetworkError):
+        logger.warning("네트워크 오류 (자동 재시도): %s", err)
+        return
+    logger.error("처리되지 않은 예외", exc_info=err)
+
+    summary = f"{type(err).__name__}: {err}"
+    now = time.monotonic()
+    if now - _last_error_alert.get(summary, -ERROR_ALERT_INTERVAL) < ERROR_ALERT_INTERVAL:
+        return
+    _last_error_alert[summary] = now
+
+    text = (
+        f"🚨 <b>봇 오류</b>\n<code>{html.escape(summary[:1000])}</code>\n\n"
+        f"자세한 내용은 서버 로그를 보라."
+    )
+    for admin_id in admin_chat_ids():
+        try:
+            await context.bot.send_message(admin_id, text, parse_mode=ParseMode.HTML)
+        except TelegramError as e:
+            logger.warning("오류 알림 전송 실패 (chat_id=%s): %s", admin_id, e)
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -2357,6 +2390,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_revoke, pattern=r"^revoke:-?\d+$"))
     app.add_handler(login_conv)
     app.add_handler(conv)
+    app.add_error_handler(on_error)
 
     logger.info(
         "봇 시작 (관리자=%s, 고정 허용=%s)",

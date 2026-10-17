@@ -668,6 +668,11 @@ When you want change ID using existing object,
         if self.want_feedback:
             print(j['h_msg_txt'])
 
+        # 정상 응답에는 항상 strResult 가 있다. 없으면 차단·점검 같은 다른 형식의
+        # 응답이라, KeyError 로 죽는 대신 원문 일부를 담아 KorailError 로 올린다.
+        if 'strResult' not in j:
+            raise KorailError("예상치 못한 응답: %s" % json.dumps(j, ensure_ascii=False)[:300], None)
+
         if j['strResult'] == 'FAIL':
             h_msg_cd = j.get('h_msg_cd')
             h_msg_txt = j.get('h_msg_txt')
