@@ -55,7 +55,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import NetworkError, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1385,7 +1385,11 @@ def _date_keyboard(today=None):
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("취소", callback_data="cancel")])
+    # 버튼은 +7 이후 주 단위라 그 사이 날짜는 직접 입력으로만 고를 수 있다.
+    rows.append([
+        InlineKeyboardButton("직접 입력", callback_data="date:_text"),
+        InlineKeyboardButton("취소", callback_data="cancel"),
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1442,11 +1446,38 @@ async def conv_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "cancel":
         await query.edit_message_text(CONV_CANCELLED)
         return ConversationHandler.END
+    if query.data == "date:_text":
+        await query.edit_message_text(DATE_TEXT_PROMPT)
+        return ASK_DATE
     if not query.data.startswith("date:"):
         return ASK_DATE
     ymd = query.data.split(":", 1)[1]
     context.user_data[KEY_DATE] = ymd
     await query.edit_message_text(
+        f"📅 출발일: <b>{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}</b>\n\n"
+        f"🕐 <b>출발 시각</b>을 고르라. 이 시각 이후로 출발하는 열차를 찾는다.",
+        reply_markup=_time_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
+    return ASK_TIME
+
+
+DATE_TEXT_PROMPT = "📅 출발일을 입력하라. 예: 20261030 / +10 (오늘부터 10일 뒤) / 내일"
+
+
+async def conv_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # parse_date 는 8자리 숫자면 그대로 돌려주므로 실제 달력 날짜인지 따로 본다.
+    try:
+        ymd = parse_date(update.message.text)
+        d = date(int(ymd[:4]), int(ymd[4:6]), int(ymd[6:]))
+    except ValueError:
+        await update.message.reply_text(f"날짜를 알아볼 수 없다.\n{DATE_TEXT_PROMPT}")
+        return ASK_DATE
+    if d < date.today():
+        await update.message.reply_text(f"이미 지난 날짜다.\n{DATE_TEXT_PROMPT}")
+        return ASK_DATE
+    context.user_data[KEY_DATE] = ymd
+    await update.message.reply_text(
         f"📅 출발일: <b>{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}</b>\n\n"
         f"🕐 <b>출발 시각</b>을 고르라. 이 시각 이후로 출발하는 열차를 찾는다.",
         reply_markup=_time_keyboard(),
@@ -1555,6 +1586,7 @@ async def _show_trains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except NoResultsError:
         trains = []
     except KorailError as e:
+        logger.warning("열차 검색 실패: %s", e)
         await update.effective_message.reply_text(
             f"❌ <b>열차 검색 실패</b>\n<code>{html.escape(str(e))}</code>\n\n"
             f"역 이름이 정확한지 확인하고 /reserve 로 다시 시도하라.",
@@ -2243,6 +2275,38 @@ async def report_config(app: Application):
             logger.warning("설정 경고 전송 실패 (chat_id=%s): %s", admin_id, e)
 
 
+# 같은 오류가 반복되면(예: 다른 곳에서 같은 토큰으로 polling → Conflict) 몇 초마다
+# 알림이 쏟아진다. 같은 내용은 이 간격 안에 한 번만 보낸다.
+ERROR_ALERT_INTERVAL = 600
+_last_error_alert: dict = {}
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """처리되지 않은 예외를 로그로 남기고 관리자에게만 알린다."""
+    err = context.error
+    # long polling 연결 끊김은 흔하고 PTB 가 알아서 재시도한다. 알릴 일이 아니다.
+    if isinstance(err, NetworkError):
+        logger.warning("네트워크 오류 (자동 재시도): %s", err)
+        return
+    logger.error("처리되지 않은 예외", exc_info=err)
+
+    summary = f"{type(err).__name__}: {err}"
+    now = time.monotonic()
+    if now - _last_error_alert.get(summary, -ERROR_ALERT_INTERVAL) < ERROR_ALERT_INTERVAL:
+        return
+    _last_error_alert[summary] = now
+
+    text = (
+        f"🚨 <b>봇 오류</b>\n<code>{html.escape(summary[:1000])}</code>\n\n"
+        f"자세한 내용은 서버 로그를 보라."
+    )
+    for admin_id in admin_chat_ids():
+        try:
+            await context.bot.send_message(admin_id, text, parse_mode=ParseMode.HTML)
+        except TelegramError as e:
+            logger.warning("오류 알림 전송 실패 (chat_id=%s): %s", admin_id, e)
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -2296,7 +2360,10 @@ def main():
         entry_points=[CommandHandler('reserve', conv_start)],
         states={
             ASK_COUNT: [CallbackQueryHandler(conv_count, pattern=r"^(cnt:|cancel$)")],
-            ASK_DATE: [CallbackQueryHandler(conv_date, pattern=r"^(date:|cancel$)")],
+            ASK_DATE: [
+                CallbackQueryHandler(conv_date, pattern=r"^(date:|cancel$)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_date_text),
+            ],
             ASK_TIME: [CallbackQueryHandler(conv_time, pattern=r"^(time:|cancel$)")],
             ASK_DEP: [
                 CallbackQueryHandler(conv_dep, pattern=r"^(dep:|cancel$)"),
@@ -2323,6 +2390,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_revoke, pattern=r"^revoke:-?\d+$"))
     app.add_handler(login_conv)
     app.add_handler(conv)
+    app.add_error_handler(on_error)
 
     logger.info(
         "봇 시작 (관리자=%s, 고정 허용=%s)",

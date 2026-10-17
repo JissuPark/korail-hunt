@@ -9,7 +9,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from telegram.error import TelegramError
@@ -18,6 +18,7 @@ import bot
 from bot import (
     ASK_COUNT,
     ASK_DATE,
+    ASK_TIME,
     KEY_ADULTS,
     KEY_ARR,
     KEY_DATE,
@@ -37,6 +38,7 @@ from bot import (
     Session,
     _chat_hunts,
     _count_keyboard,
+    _date_keyboard,
     _format_hunt_label,
     _help_for,
     _hunt_loop,
@@ -56,6 +58,8 @@ from bot import (
     cmd_reservations,
     cmd_users,
     conv_count,
+    conv_date,
+    conv_date_text,
     conv_option,
     describe_passengers,
     dump_sessions,
@@ -1155,6 +1159,104 @@ class ConvCountTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_callback_stays_in_state(self):
         self.assertEqual(await conv_count(_callback_update(data='nope'), _ctx()), ASK_COUNT)
+
+
+class DateKeyboardTests(unittest.TestCase):
+
+    def test_offers_text_input_and_cancel(self):
+        data = [b.callback_data for row in _date_keyboard().inline_keyboard for b in row]
+        self.assertIn('date:_text', data)
+        self.assertIn('cancel', data)
+
+
+class ConvDateTests(unittest.IsolatedAsyncioTestCase):
+    # 버튼은 0~7일·14·21·28일뿐이라 그 사이 날짜는 직접 입력으로 고른다.
+
+    async def test_text_button_prompts_and_stays_in_state(self):
+        ctx = _ctx()
+        up = _callback_update(data='date:_text')
+        self.assertEqual(await conv_date(up, ctx), ASK_DATE)
+        self.assertNotIn(KEY_DATE, ctx.user_data)
+        self.assertIn('입력', up.callback_query.edit_message_text.await_args[0][0])
+
+    async def test_button_date_still_moves_to_time(self):
+        ctx = _ctx()
+        self.assertEqual(await conv_date(_callback_update(data='date:20991231'), ctx), ASK_TIME)
+        self.assertEqual(ctx.user_data[KEY_DATE], '20991231')
+
+    async def test_typed_yyyymmdd_moves_to_time(self):
+        ctx = _ctx()
+        ymd = (date.today() + timedelta(days=10)).strftime('%Y%m%d')
+        self.assertEqual(await conv_date_text(_update(111, text=ymd), ctx), ASK_TIME)
+        self.assertEqual(ctx.user_data[KEY_DATE], ymd)
+
+    async def test_typed_relative_offset_moves_to_time(self):
+        ctx = _ctx()
+        expected = (date.today() + timedelta(days=10)).strftime('%Y%m%d')
+        self.assertEqual(await conv_date_text(_update(111, text=' +10 '), ctx), ASK_TIME)
+        self.assertEqual(ctx.user_data[KEY_DATE], expected)
+
+    async def test_today_is_accepted(self):
+        ctx = _ctx()
+        self.assertEqual(await conv_date_text(_update(111, text='오늘'), ctx), ASK_TIME)
+
+    async def test_unparseable_text_asks_again(self):
+        ctx = _ctx()
+        up = _update(111, text='다음주 금요일')
+        self.assertEqual(await conv_date_text(up, ctx), ASK_DATE)
+        self.assertNotIn(KEY_DATE, ctx.user_data)
+        up.message.reply_text.assert_awaited_once()
+
+    async def test_impossible_calendar_date_asks_again(self):
+        ctx = _ctx()
+        self.assertEqual(await conv_date_text(_update(111, text='20261332'), ctx), ASK_DATE)
+        self.assertNotIn(KEY_DATE, ctx.user_data)
+
+    async def test_past_date_asks_again(self):
+        ctx = _ctx()
+        ymd = (date.today() - timedelta(days=1)).strftime('%Y%m%d')
+        up = _update(111, text=ymd)
+        self.assertEqual(await conv_date_text(up, ctx), ASK_DATE)
+        self.assertNotIn(KEY_DATE, ctx.user_data)
+        self.assertIn('지난', up.message.reply_text.await_args[0][0])
+
+
+class OnErrorTests(unittest.IsolatedAsyncioTestCase):
+    # 처리되지 않은 예외는 관리자에게만 알린다. polling 끊김은 알리지 않는다.
+
+    def setUp(self):
+        bot._last_error_alert.clear()
+        patcher = patch.dict(os.environ, {'TELEGRAM_ADMIN_CHAT_IDS': '111'})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _ctx_with_error(self, err):
+        ctx = _ctx()
+        ctx.error = err
+        return ctx
+
+    async def test_unhandled_error_alerts_admin_only(self):
+        ctx = self._ctx_with_error(KeyError('strResult'))
+        await bot.on_error(_update(222), ctx)
+        ctx.bot.send_message.assert_awaited_once()
+        self.assertEqual(ctx.bot.send_message.await_args[0][0], 111)
+        self.assertIn('KeyError', ctx.bot.send_message.await_args[0][1])
+
+    async def test_network_error_is_not_alerted(self):
+        ctx = self._ctx_with_error(bot.NetworkError('read error'))
+        await bot.on_error(None, ctx)
+        ctx.bot.send_message.assert_not_awaited()
+
+    async def test_same_error_is_alerted_once_per_interval(self):
+        ctx = self._ctx_with_error(KeyError('strResult'))
+        await bot.on_error(None, ctx)
+        await bot.on_error(None, ctx)
+        self.assertEqual(ctx.bot.send_message.await_count, 1)
+
+    async def test_send_failure_does_not_raise(self):
+        ctx = self._ctx_with_error(ValueError('boom'))
+        ctx.bot.send_message = AsyncMock(side_effect=TelegramError('blocked'))
+        await bot.on_error(None, ctx)
 
 
 class HuntLabelTests(unittest.TestCase):
