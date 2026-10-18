@@ -11,10 +11,12 @@ from unittest.mock import Mock, patch
 from korail2 import (
     AdultPassenger,
     ChildPassenger,
+    DynaPathError,
     Korail,
     KorailError,
     NeedToLoginError,
     NoResultsError,
+    PatchedKorail,
     Passenger,
     ReserveOption,
     SeniorPassenger,
@@ -22,7 +24,7 @@ from korail2 import (
     ToddlerPassenger,
     TrainType,
 )
-from korail2.korail2 import Reservation, Schedule, Ticket, Train
+from korail2.korail2 import DynaPathMasterEngine, Reservation, Schedule, Ticket, Train
 
 
 # ---------------------------------------------------------------------------
@@ -734,6 +736,97 @@ class InstanceIsolationTests(unittest.TestCase):
         b = Korail("22222222", "pw", auto_login=False)
         a._session.headers.update({'X-Test': 'a'})
         self.assertNotIn('X-Test', b._session.headers)
+
+
+# ---------------------------------------------------------------------------
+# DynaPath / PatchedKorail
+# ---------------------------------------------------------------------------
+
+class DynaPathAndPatchedKorailTests(unittest.TestCase):
+
+    def test_dynapath_block_payload_raises_dynapath_error(self):
+        k = Korail("12345678", "pw", auto_login=False)
+        payload = {
+            "code": -2000,
+            "id": "a6671fea-ff47-d8a6-99bf-35f8268a9a99",
+            "message": "원활한 서비스를 위해 안정적인 환경에서 앱을 이용해 주시기 바랍니다",
+        }
+        with self.assertRaises(DynaPathError) as cm:
+            k._result_check(payload)
+        self.assertEqual(cm.exception.code, -2000)
+        self.assertIn("-2000", str(cm.exception))
+
+    def test_dynapath_engine_tracks_recent_intervals_and_sdk_version(self):
+        engine = DynaPathMasterEngine()
+        ts1 = int(engine.app_start_ts) + 100
+        plain1 = engine._build_plaintext("a1b2c3d4e5f60718", ts1)
+        self.assertIn("sv=v1.0.3", plain1)
+        self.assertIn("&rt=100&", plain1)
+
+        ts2 = ts1 + 250
+        plain2 = engine._build_plaintext("a1b2c3d4e5f60718", ts2)
+        self.assertIn("&rt=100&rt=250&", plain2)
+        tok = engine.generate_token("a1b2c3d4e5f60718", ts2 + 50, "Ab12")
+        self.assertTrue(tok.startswith("bEeEP"))
+
+    def test_patched_korail_uses_unique_device_id_and_rotates_on_reset(self):
+        a = PatchedKorail("11111111", "pw", auto_login=False)
+        b = PatchedKorail("22222222", "pw", auto_login=False)
+        self.assertNotEqual(a._device_id, b._device_id)
+        old_id = a._device_id
+        old_engine = a._engine
+        new_id = a.reset_dynapath_device()
+        self.assertEqual(new_id, a._device_id)
+        self.assertNotEqual(old_id, new_id)
+        self.assertIsNot(old_engine, a._engine)
+
+    def test_patched_korail_search_train_posts_form_body_not_query_params(self):
+        k = PatchedKorail("12345678", "pw", auto_login=False)
+        k.logined = True
+        k._key = "session_key"
+        k.membership_number = "12345678"
+        resp = make_response({
+            "strResult": "SUCC",
+            "h_msg_cd": "",
+            "h_msg_txt": "",
+            "trn_infos": {"trn_info": [make_train_data(general="11")]},
+        })
+        with patch.object(k._session, 'post', return_value=resp) as mp:
+            trains = k.search_train("서울", "부산", "20260601", "100000")
+        self.assertEqual(len(trains), 1)
+        mp.assert_called_once()
+        _, kwargs = mp.call_args
+        self.assertIn('data', kwargs)
+        self.assertNotIn('params', kwargs)
+        self.assertEqual(kwargs['data']['Device'], 'AD')
+        self.assertEqual(kwargs['data']['Version'], '250601003')
+        self.assertEqual(kwargs['data']['AppVersion'], '7.0.8')
+
+    def test_patched_korail_reserve_posts_form_body(self):
+        k = PatchedKorail("12345678", "pw", auto_login=False)
+        k.logined = True
+        k._key = "session_key"
+        k.membership_number = "12345678"
+        train = Train(make_train_data(general="11"))
+
+        def side_effect(url, **kwargs):
+            self.assertIn('data', kwargs)
+            self.assertNotIn('params', kwargs)
+            if 'TicketReservation' in url:
+                return make_response({"strResult": "SUCC", "h_pnr_no": "PNR1234"})
+            if 'ReservationView' in url:
+                return make_response({
+                    "strResult": "SUCC",
+                    "jrny_infos": {"jrny_info": [{"train_infos": {"train_info": [
+                        make_reservation_data(h_pnr_no="PNR1234"),
+                    ]}}]},
+                })
+            raise AssertionError(url)
+
+        with patch.object(k._session, 'post', side_effect=side_effect) as mp:
+            rsv = k.reserve(train)
+        self.assertEqual(rsv.rsv_id, "PNR1234")
+        self.assertEqual(mp.call_count, 2)
 
 
 if __name__ == '__main__':

@@ -6,6 +6,7 @@
     :license: BSD, see LICENSE for more details.
 """
 import base64
+from collections import deque
 import itertools
 import json
 import logging
@@ -13,9 +14,12 @@ import os
 import random
 import re
 import string
+import threading
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from functools import reduce
+from urllib.parse import quote_plus
 
 import requests
 from Crypto.Cipher import AES
@@ -53,8 +57,7 @@ KORAIL_PAYMENT_VOUCHER = "%s/ebizmw/PrdPkgBoucherView.do" % KORAIL_DOMAIN
 KORAIL_CODE = "%s.common.code.do" % KORAIL_MOBILE
 
 # 코레일이 너무 오래된 UA 를 매크로로 판정한다. 환경변수 KORAIL_USER_AGENT 로 오버라이드 가능.
-# Android 13 빌드 문자열은 NomaDamas/k-skill 가 MACRO ERROR 우회에 사용해 검증된 값.
-DEFAULT_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 13; SM-S928N Build/UP1A.231005.007)"
+DEFAULT_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 17; SM-S948N Build/AP3A.240905.015.A2)"
 
 # DynaPath anti-bot 체크가 적용되는 엔드포인트 경로. 이 경로들에는 매 요청마다
 # x-dynapath-m-token 헤더와 Sid 폼 필드를 주입해야 한다.
@@ -65,7 +68,17 @@ DYNAPATH_PATHS = [
     "/classes/com.korail.mobile.seatMovie.ScheduleViewSpecial",
     "/classes/com.korail.mobile.trn.prcFare.do",
     "/classes/com.korail.mobile.login.Login",
+    "/classes/com.korail.mobile.common.code.do",
+    "/classes/com.korail.mobile.reservation.ReservationView",
+    "/classes/com.korail.mobile.reservationCancel.ReservationCancel",
+    "/classes/com.korail.mobile.reservationCancel.ReservationCancelChk",
+    "/classes/com.korail.mobile.myTicket.MyTicketList",
+    "/classes/com.korail.mobile.refunds.SelTicketInfo",
+    "/classes/com.korail.mobile.refunds.RefundsRequest",
 ]
+
+# DynaPath 차단 응답 코드 (DynaPathInterceptor 기준).
+DYNAPATH_BLOCK_CODES = frozenset({-1203, -1406, -2000, -8005, -8201, -8202, -8203})
 
 
 class Schedule:
@@ -518,6 +531,28 @@ class SoldOutError(KorailError):
         KorailError.__init__(self, "Sold out", code)
 
 
+class DynaPathError(KorailError):
+    """DynaPath anti-bot / WAF 차단 응답 예외 (예: code=-2000)."""
+    codes = {str(c) for c in DYNAPATH_BLOCK_CODES} | set(DYNAPATH_BLOCK_CODES)
+
+    def __init__(self, msg="원활한 서비스를 위해 안정적인 환경에서 앱을 이용해 주시기 바랍니다.", code=-2000):
+        KorailError.__init__(self, msg, code)
+
+
+def _is_dynapath_block(payload):
+    """DynaPath 차단 페이로드 여부 판정 (strResult 없이 code=-2000 등의 차단 코드 포함)."""
+    if not isinstance(payload, dict) or 'strResult' in payload:
+        return False
+    if payload.get('code') == '-2000':
+        return True
+    for value in payload.values():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value in DYNAPATH_BLOCK_CODES:
+            return True
+    return False
+
+
 class Korail:
     """Korail object"""
 
@@ -558,7 +593,7 @@ class Korail:
         r = self._session.post(url, data=data)
         j = json.loads(r.text)
 
-        if j['strResult'] == 'SUCC' and j.get('app.login.cphd') is not None:
+        if j.get('strResult') == 'SUCC' and j.get('app.login.cphd') is not None:
             self._idx = j['app.login.cphd']['idx']
             key = j['app.login.cphd']['key']
 
@@ -639,7 +674,7 @@ When you want change ID using existing object,
         r = self._session.post(url, data=data)
         j = json.loads(r.text)
 
-        if j['strResult'] == 'SUCC' and j.get('strMbCrdNo') is not None:
+        if j.get('strResult') == 'SUCC' and j.get('strMbCrdNo') is not None:
             self._key = j['Key']
             self.membership_number = j['strMbCrdNo']
             self.name = j['strCustNm']
@@ -665,13 +700,16 @@ When you want change ID using existing object,
 
     def _result_check(self, j):
         """Result data check"""
-        if self.want_feedback:
-            print(j['h_msg_txt'])
-
         # 정상 응답에는 항상 strResult 가 있다. 없으면 차단·점검 같은 다른 형식의
         # 응답이라, KeyError 로 죽는 대신 원문 일부를 담아 KorailError 로 올린다.
         if 'strResult' not in j:
+            if _is_dynapath_block(j):
+                msg = j.get('message') or ("예상치 못한 응답: %s" % json.dumps(j, ensure_ascii=False)[:300])
+                raise DynaPathError(msg, j.get('code'))
             raise KorailError("예상치 못한 응답: %s" % json.dumps(j, ensure_ascii=False)[:300], None)
+
+        if self.want_feedback:
+            print(j['h_msg_txt'])
 
         if j['strResult'] == 'FAIL':
             h_msg_cd = j.get('h_msg_cd')
@@ -1008,17 +1046,23 @@ there are 4 options in ReserveOption class.
 # 그대로 포팅했다. anti-bot 규칙이 또 바뀌면 이 코드도 같이 손봐야 한다.
 class DynaPathMasterEngine:
     APP_ID = "com.korail.talk"
-    AS_VALUE = "%5B38ff229cb34c7dda8e28220a2d750cce%5D"
-    DEVICE_MODEL = "SM-S928N"
+    AS_VALUE = "[38ff229cb34c7dda8e28220a2d750cce]"
+    DEVICE_MODEL = "SM-S948N"
     OS_TYPE = "Android"
-    SDK_VERSION = "v1"
+    OS_RELEASE = "17"
+    SDK_VERSION = "v1.0.3"
+    NONCE_ALPHABET = string.ascii_lowercase + string.ascii_uppercase + string.digits
 
     def __init__(self):
         self.table = "3FE9jgRD4KdCyuawklqGJYmvfMn15P7US8XbxeLQtWT6OicBAopINs2Vh0HZrz"
         self.i8 = 161
         self.i9 = 30
         self.i10 = 2
-        self.app_start_ts = str(int(time.time() * 1000))
+        self._start_ts_ms = int(time.time() * 1000)
+        self.app_start_ts = str(self._start_ts_ms)
+        self._last_ts = None
+        self._recent_intervals = deque(maxlen=5)
+        self._lock = threading.Lock()
 
     def string2xa1s(self, data):
         result = []
@@ -1104,12 +1148,41 @@ class DynaPathMasterEngine:
                 tail -= 1
         return "".join(output)
 
+    def _build_plaintext(self, device_id, timestamp_ms):
+        ts = int(timestamp_ms)
+        with self._lock:
+            ref_ts = int(self.app_start_ts) if self._last_ts is None else self._last_ts
+            interval = max(0, ts - ref_ts)
+            self._recent_intervals.append(interval)
+            self._last_ts = ts
+            intervals = list(self._recent_intervals)
+
+        as_val = self.AS_VALUE
+        # 이미 URL 인코딩된 값을 덮어쓴 경우(%5B...%5D) 이중 인코딩을 피한다.
+        if as_val.startswith("%5B") and as_val.endswith("%5D"):
+            as_val = "[" + as_val[3:-3] + "]"
+
+        pairs = [
+            ("ai", self.APP_ID),
+            ("di", str(device_id)),
+            ("as", as_val),
+            ("su", "false"),
+            ("dbg", "false"),
+            ("emu", "false"),
+            ("hk", "false"),
+            ("it", str(self.app_start_ts)),
+            ("ts", str(ts)),
+            *(("rt", str(iv)) for iv in intervals),
+            ("os", str(self.OS_RELEASE)),
+            ("dm", str(self.DEVICE_MODEL)),
+            ("st", str(self.OS_TYPE)),
+            ("sv", str(self.SDK_VERSION)),
+        ]
+        return "&".join(f"{quote_plus(k)}={quote_plus(v)}" for k, v in pairs)
+
     def generate_token(self, device_id, timestamp_ms, nonce):
-        plaintext = (
-            f"ai={self.APP_ID}&di={device_id}&as={self.AS_VALUE}&su=false&dbg=false&emu=false&hk=false"
-            f"&it={self.app_start_ts}&ts={timestamp_ms}&rt=0&os=13&dm={self.DEVICE_MODEL}&st={self.OS_TYPE}&sv={self.SDK_VERSION}"
-        )
-        dyn_key = f"v1+{nonce}+{timestamp_ms}"
+        plaintext = self._build_plaintext(device_id, timestamp_ms)
+        dyn_key = f"{self.SDK_VERSION}+{nonce}+{timestamp_ms}"
         key_encoded = self.encode_normal_be(dyn_key, self.table)
         encode_table = self.make_encode_table(self.make_key(dyn_key), self.i9, self.table)
         body_encoded = self.encode_normal_be(plaintext, encode_table)
@@ -1124,14 +1197,24 @@ class PatchedKorail(Korail):
 
     def __init__(self, korail_id, korail_pw, auto_login=True, want_feedback=False):
         super().__init__(korail_id, korail_pw, auto_login=False, want_feedback=want_feedback)
-        # k-skill 검증값: Device='AD'(Android) 고정, Version='250601002'.
-        # KORAIL_LOGIN_VERSION 환경변수로 오버라이드 가능 (anti-bot 규칙이 또 바뀔 때 대비).
+        # Korail+ 7.0.8 기준: Device='AD'(Android), Version='250601003', AppVersion='7.0.8'.
+        # KORAIL_LOGIN_VERSION / KORAIL_APP_VERSION 환경변수로 오버라이드 가능.
         self._device = 'AD'
         # 빈 문자열도 default 로 떨어지도록 `or` 사용 (.env 의 빈 값 처리).
-        self._version = os.environ.get('KORAIL_LOGIN_VERSION') or '250601002'
+        self._version = os.environ.get('KORAIL_LOGIN_VERSION') or '250601003'
+        self._app_version = os.environ.get('KORAIL_APP_VERSION') or '7.0.8'
+        # 모든 인스턴스가 동일한 고정 device_id 를 쓰면 DynaPath 기기 단위 차단에 걸리므로
+        # 인스턴스마다 고유 16자리 hex 식별자를 생성한다 (환경변수로 고정 가능).
+        self._device_id = os.environ.get('KORAIL_DEVICE_ID') or uuid.uuid4().hex[:16]
         self._engine = DynaPathMasterEngine()
         if auto_login:
             self.login(korail_id, korail_pw)
+
+    def reset_dynapath_device(self):
+        """DynaPath 차단(-2000 등) 감지 시 기기 식별자와 타임스탬프/rt 이력을 새로 고친다."""
+        self._device_id = os.environ.get('KORAIL_DEVICE_ID') or uuid.uuid4().hex[:16]
+        self._engine = DynaPathMasterEngine()
+        return self._device_id
 
     def _generate_sid(self, timestamp_ms):
         plaintext = f"{self._device}{timestamp_ms}".encode("utf-8")
@@ -1142,11 +1225,46 @@ class PatchedKorail(Korail):
         if not any(path in url for path in DYNAPATH_PATHS):
             return {}, None
         timestamp_ms = int(time.time() * 1000)
-        nonce = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        nonce = "".join(random.choices(DynaPathMasterEngine.NONCE_ALPHABET, k=4))
         headers = {
             "x-dynapath-m-token": self._engine.generate_token(self._device_id, timestamp_ms, nonce),
         }
         return headers, self._generate_sid(timestamp_ms)
+
+    def _Korail__enc_password(self, password):
+        url = KORAIL_CODE
+        headers, sid = self._auth_headers_and_sid(url)
+        data = {
+            'Device': self._device,
+            'Version': self._version,
+            'AppVersion': self._app_version,
+            'Key': self._key,
+            'code': "app.login.cphd",
+        }
+        if sid:
+            data['Sid'] = sid
+
+        r = self._session.post(url, data=data, headers=headers)
+        j = json.loads(r.text)
+
+        if j.get('strResult') == 'SUCC' and j.get('app.login.cphd') is not None:
+            self._idx = j['app.login.cphd']['idx']
+            key = j['app.login.cphd']['key']
+
+            encrypt_key = key.encode(encoding='utf-8', errors='strict')
+            iv = key[:16].encode(encoding='utf-8', errors='strict')
+            cipher = AES.new(encrypt_key, AES.MODE_CBC, iv)
+
+            padded_data = pad(password.encode("utf-8"), AES.block_size)
+
+            return base64.b64encode(base64.b64encode(cipher.encrypt(padded_data))).decode("utf-8")
+        else:
+            logger.warning(
+                "비밀번호 암호화 키 발급 실패: strResult=%s h_msg_cd=%s h_msg_txt=%s raw=%s",
+                j.get('strResult'), j.get('h_msg_cd'), j.get('h_msg_txt'),
+                json.dumps(j, ensure_ascii=False)[:200] if 'strResult' not in j else '',
+            )
+            return False
 
     def login(self, korail_id=None, korail_pw=None):
         if korail_id is None:
@@ -1165,13 +1283,16 @@ class PatchedKorail(Korail):
         else:
             txt_input_flg = '2'
 
+        enc_pw = self._Korail__enc_password(korail_pw)
         headers, sid = self._auth_headers_and_sid(KORAIL_LOGIN)
         data = {
             'Device': self._device,
             'Version': self._version,
+            'AppVersion': self._app_version,
+            'Key': self._key,
             'txtInputFlg': txt_input_flg,
             'txtMemberNo': korail_id,
-            'txtPwd': self._Korail__enc_password(korail_pw),
+            'txtPwd': enc_pw,
             'idx': self._idx,
         }
         if sid:
@@ -1179,20 +1300,27 @@ class PatchedKorail(Korail):
 
         r = self._session.post(KORAIL_LOGIN, data=data, headers=headers)
         j = json.loads(r.text)
-        if j['strResult'] == 'SUCC' and j.get('strMbCrdNo') is not None:
-            self._key = j['Key']
+        if j.get('strResult') == 'SUCC' and j.get('strMbCrdNo') is not None:
+            self._key = j.get('Key', self._key)
             self.membership_number = j['strMbCrdNo']
-            self.name = j['strCustNm']
-            self.email = j['strEmailAdr']
+            self.name = j.get('strCustNm')
+            self.email = j.get('strEmailAdr')
             self.logined = True
             return True
 
-        logger.warning(
-            "로그인 실패: txtInputFlg=%s Version=%s strResult=%s "
-            "h_msg_cd=%s h_msg_txt=%s",
-            txt_input_flg, self._version, j.get('strResult'),
-            j.get('h_msg_cd'), j.get('h_msg_txt'),
-        )
+        if _is_dynapath_block(j):
+            logger.warning(
+                "로그인 DynaPath 차단: code=%s message=%s",
+                j.get('code'), j.get('message'),
+            )
+            self.reset_dynapath_device()
+        else:
+            logger.warning(
+                "로그인 실패: txtInputFlg=%s Version=%s strResult=%s "
+                "h_msg_cd=%s h_msg_txt=%s",
+                txt_input_flg, self._version, j.get('strResult'),
+                j.get('h_msg_cd'), j.get('h_msg_txt'),
+            )
         self.logined = False
         return False
 
@@ -1215,6 +1343,9 @@ class PatchedKorail(Korail):
         headers, sid = self._auth_headers_and_sid(KORAIL_SEARCH_SCHEDULE)
         data = {
             'Device': self._device,
+            'Version': self._version,
+            'AppVersion': self._app_version,
+            'Key': self._key,
             'radJobId': '1',
             'selGoTrain': train_type,
             'txtCardPsgCnt': '0',
@@ -1235,12 +1366,14 @@ class PatchedKorail(Korail):
             'txtSeatAttCd_3': '000',
             'txtSeatAttCd_4': '015',
             'txtTrnGpCd': train_type,
-            'Version': self._version,
         }
+        if self.membership_number:
+            data['mbCrdNo'] = self.membership_number
         if sid:
             data['Sid'] = sid
 
-        r = self._session.post(KORAIL_SEARCH_SCHEDULE, params=data, headers=headers)
+        # ScheduleView 는 @FormUrlEncoded POST 이므로 URL 쿼리(params)가 아닌 form body(data)로 전송한다.
+        r = self._session.post(KORAIL_SEARCH_SCHEDULE, data=data, headers=headers)
         j = json.loads(r.text)
         if self._result_check(j):
             trains = [Train(info) for info in j['trn_infos']['trn_info']]
@@ -1292,6 +1425,7 @@ class PatchedKorail(Korail):
         data = {
             'Device': self._device,
             'Version': self._version,
+            'AppVersion': self._app_version,
             'Key': self._key,
             'txtGdNo': '',
             'txtJobId': '1101' if reserving_seat else '1102',
@@ -1317,7 +1451,7 @@ class PatchedKorail(Korail):
             'txtTrnClsfCd1': train.train_type,
             'txtPsrmClCd1': seat_type,
             'txtTrnGpCd1': train.train_group,
-            'txtChgFlg1': '',
+            'txtChgFlg1': 'N',
             'txtJrnySqno2': '',
             'txtJrnyTpCd2': '',
             'txtDptDt2': '',
@@ -1335,7 +1469,8 @@ class PatchedKorail(Korail):
         for index, passenger in enumerate(passengers, start=1):
             data.update(passenger.get_dict(index))
 
-        r = self._session.get(KORAIL_TICKETRESERVATION, params=data, headers=headers)
+        # TicketReservation 역시 POST form body 로 전송한다.
+        r = self._session.post(KORAIL_TICKETRESERVATION, data=data, headers=headers)
         j = json.loads(r.text)
         if self._result_check(j):
             reservation_id = j['h_pnr_no']
@@ -1343,3 +1478,50 @@ class PatchedKorail(Korail):
             if len(matches) == 1:
                 return matches[0]
             raise KorailError(f"reservation {reservation_id} was created but could not be reloaded")
+
+    def reservations(self):
+        """Get my reservations (with DynaPath token)"""
+        url = KORAIL_MYRESERVATIONLIST
+        headers, sid = self._auth_headers_and_sid(url)
+        data = {
+            'Device': self._device,
+            'Version': self._version,
+            'AppVersion': self._app_version,
+            'Key': self._key,
+        }
+        if sid:
+            data['Sid'] = sid
+        r = self._session.post(url, data=data, headers=headers)
+        j = json.loads(r.text)
+        try:
+            if self._result_check(j):
+                rsv_infos = j['jrny_infos']['jrny_info']
+                reserves = []
+                for info in rsv_infos:
+                    for tinfo in info['train_infos']['train_info']:
+                        reserves.append(Reservation(tinfo))
+                return reserves
+        except NoResultsError:
+            return []
+
+    def cancel(self, rsv):
+        """Cancel a reservation (with DynaPath token)."""
+        assert isinstance(rsv, Reservation)
+        url = KORAIL_CANCEL
+        headers, sid = self._auth_headers_and_sid(url)
+        data = {
+            'Device': self._device,
+            'Version': self._version,
+            'AppVersion': self._app_version,
+            'Key': self._key,
+            'txtPnrNo': rsv.rsv_id,
+            'txtJrnySqno': rsv.journey_no,
+            'txtJrnyCnt': rsv.journey_cnt,
+            'hidRsvChgNo': rsv.rsv_chg_no,
+        }
+        if sid:
+            data['Sid'] = sid
+        r = self._session.post(url, data=data, headers=headers)
+        j = json.loads(r.text)
+        if self._result_check(j):
+            return True
