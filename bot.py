@@ -69,6 +69,7 @@ from telegram.ext import (
 from korail2 import (
     AdultPassenger,
     ChildPassenger,
+    DynaPathError,
     Korail,
     KorailError,
     NoResultsError,
@@ -865,7 +866,13 @@ async def _korail_call(session: 'Session', fn, *args, **kwargs):
     """한 세션의 코레일 호출을 직렬화. requests.Session 이 thread-safe 하지 않아
     동시 헌팅 N개가 cookie jar 등을 손상시키는 걸 막는다."""
     async with session.lock:
-        return await asyncio.to_thread(fn, *args, **kwargs)
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        except DynaPathError:
+            reset = getattr(session.korail, 'reset_dynapath_device', None)
+            if callable(reset):
+                reset()
+            raise
 
 
 async def _ensure_login(session: 'Session'):
@@ -1585,6 +1592,15 @@ async def _show_trains(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except NoResultsError:
         trains = []
+    except DynaPathError as e:
+        logger.warning("열차 검색 실패 (DynaPath 차단): %s", e)
+        await update.effective_message.reply_text(
+            f"🚫 <b>코레일 접근 차단 (DynaPath)</b>\n<code>{html.escape(str(e))}</code>\n\n"
+            f"코레일 매크로 감지(요청 빈도·기기 식별자·서버 IP 대역 등)로 요청이 차단됐다. "
+            f"진행 중인 헌팅이 많다면 /hunt_stop 으로 줄이고 잠시 후 /reserve 로 다시 시도하라.",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
     except KorailError as e:
         logger.warning("열차 검색 실패: %s", e)
         await update.effective_message.reply_text(
@@ -1997,6 +2013,10 @@ async def _start_hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# DynaPath 차단(-2000 등) 감지 시 짧은 주기로 재시도하면 차단이 유지되므로 백오프한다.
+DYNAPATH_BACKOFF_SECONDS = 30.0
+
+
 async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t,
                      passengers, interval):
     korail: Korail = session.korail
@@ -2013,6 +2033,11 @@ async def _hunt_loop(context, session, chat_id, hunt_id, label, dep, arr, d, t,
                 )
             except NoResultsError:
                 await asyncio.sleep(interval)
+                continue
+            except DynaPathError as e:
+                backoff = max(interval, DYNAPATH_BACKOFF_SECONDS)
+                logger.warning("hunt[%s] DynaPath 차단 (%.0f초 백오프): %s", hunt_id, backoff, e)
+                await asyncio.sleep(backoff)
                 continue
             except KorailError as e:
                 logger.warning("hunt[%s] search: %s", hunt_id, e)
@@ -2129,6 +2154,11 @@ async def _train_hunt_loop(context, session, chat_id, hunt_id, label, target,
                 )
             except NoResultsError:
                 await asyncio.sleep(interval)
+                continue
+            except DynaPathError as e:
+                backoff = max(interval, DYNAPATH_BACKOFF_SECONDS)
+                logger.warning("train hunt[%s] DynaPath 차단 (%.0f초 백오프): %s", hunt_id, backoff, e)
+                await asyncio.sleep(backoff)
                 continue
             except KorailError as e:
                 logger.warning("train hunt[%s] search: %s", hunt_id, e)

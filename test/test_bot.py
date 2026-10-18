@@ -1642,5 +1642,54 @@ class HuntSpecTests(unittest.TestCase):
             _load_hunt_spec(raw)
 
 
+class DynaPathBotHandlingTests(unittest.IsolatedAsyncioTestCase):
+
+    async def test_korail_call_resets_dynapath_device_on_dynapath_error(self):
+        korail = MagicMock()
+        session = Session(korail)
+
+        def fail_fn():
+            raise bot.DynaPathError("원활한 서비스를 위해...", "-2000")
+
+        with self.assertRaises(bot.DynaPathError):
+            await bot._korail_call(session, fail_fn)
+        korail.reset_dynapath_device.assert_called_once()
+
+    async def test_show_trains_displays_dynapath_block_message(self):
+        ctx = _ctx()
+        ctx.user_data.update({
+            KEY_ADULTS: 1, KEY_DATE: '20260601', KEY_TIME: '100000',
+            KEY_DEP: '서울', KEY_ARR: '부산',
+        })
+        session = Session(MagicMock())
+        up = _callback_update()
+        err = bot.DynaPathError("원활한 서비스를 위해 안정적인 환경에서 앱을 이용해 주시기 바랍니다", "-2000")
+        with patch.object(bot, '_session_or_end', AsyncMock(return_value=session)), \
+             patch.object(bot, '_ensure_login', AsyncMock(return_value=True)), \
+             patch.object(bot, '_korail_call', AsyncMock(side_effect=err)):
+            await _show_trains(up, ctx)
+        msg = up.effective_message.reply_text.await_args[0][0]
+        self.assertIn("코레일 접근 차단", msg)
+        self.assertNotIn("역 이름이 정확한지", msg)
+
+    async def test_hunt_loop_backs_off_on_dynapath_error_without_clearing_login(self):
+        ctx = _ctx()
+        korail = MagicMock()
+        korail.logined = True
+        session = Session(korail)
+        psgrs = build_passengers(1)
+        err = bot.DynaPathError("차단", "-2000")
+        call = AsyncMock(side_effect=[err, [_fake_train()], _make_reservation()])
+        sleep_mock = AsyncMock()
+        with patch.object(bot, '_ensure_login', AsyncMock(return_value=True)), \
+             patch.object(bot, '_korail_call', call), \
+             patch.object(bot, 'save_state', MagicMock()), \
+             patch.object(bot.asyncio, 'sleep', sleep_mock):
+            await _hunt_loop(ctx, session, 111, 'h1', 'label',
+                             '서울', '부산', '20260601', '100000', psgrs, 3.0)
+        self.assertTrue(korail.logined)
+        sleep_mock.assert_awaited_once_with(bot.DYNAPATH_BACKOFF_SECONDS)
+
+
 if __name__ == '__main__':
     unittest.main()
